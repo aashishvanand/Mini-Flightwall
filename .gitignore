@@ -1,6 +1,9 @@
 # Real WiFi credentials -- never commit these
 matrix64/**/secrets.h
 
+# Personal n8n workflow configs (contain home coordinates / feeder details)
+*_workflow.local.json
+
 # macOS
 .DS_Store
 

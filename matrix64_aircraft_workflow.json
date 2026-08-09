@@ -34,21 +34,11 @@
     },
     {
       "parameters": {
-        "method": "POST",
-        "url": "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token",
-        "sendBody": true,
-        "contentType": "form-urlencoded",
-        "bodyParameters": {
-          "parameters": [
-            { "name": "grant_type", "value": "client_credentials" },
-            { "name": "client_id", "value": "={{ $json.OPENSKY_CLIENT_ID }}" },
-            { "name": "client_secret", "value": "={{ $json.OPENSKY_CLIENT_SECRET }}" }
-          ]
-        }
+        "jsCode": "// Reuse the cached OpenSky JWT if it's still valid; only hit the auth\n// endpoint when it's missing or about to expire (60s safety margin).\nconst cfg = $('Config (edit per location)').item.json;\nconst staticData = $getWorkflowStaticData('global');\nconst now = Math.floor(Date.now() / 1000);\nconst SAFETY_MARGIN = 60;\n\nif (staticData.openskyToken && staticData.openskyTokenExpiry && now < staticData.openskyTokenExpiry - SAFETY_MARGIN) {\n  return [{ json: { access_token: staticData.openskyToken } }];\n}\n\nconst bodyParams = Object.entries({\n  grant_type: 'client_credentials',\n  client_id: cfg.OPENSKY_CLIENT_ID,\n  client_secret: cfg.OPENSKY_CLIENT_SECRET\n}).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');\n\nconst response = await this.helpers.httpRequest({\n  method: 'POST',\n  url: 'https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token',\n  body: bodyParams,\n  headers: { 'Content-Type': 'application/x-www-form-urlencoded' }\n});\n\nstaticData.openskyToken = response.access_token;\nstaticData.openskyTokenExpiry = now + (response.expires_in || 1800);\n\nreturn [{ json: { access_token: response.access_token } }];"
       },
-      "name": "Get OpenSky Token",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
+      "name": "Get/Refresh OpenSky Token",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [-800, 0]
     },
     {
@@ -149,8 +139,8 @@
   ],
   "connections": {
     "Every 30s": { "main": [[{ "node": "Config (edit per location)", "type": "main", "index": 0 }]] },
-    "Config (edit per location)": { "main": [[{ "node": "Get OpenSky Token", "type": "main", "index": 0 }]] },
-    "Get OpenSky Token": { "main": [[{ "node": "Fetch Nearby States", "type": "main", "index": 0 }]] },
+    "Config (edit per location)": { "main": [[{ "node": "Get/Refresh OpenSky Token", "type": "main", "index": 0 }]] },
+    "Get/Refresh OpenSky Token": { "main": [[{ "node": "Fetch Nearby States", "type": "main", "index": 0 }]] },
     "Fetch Nearby States": { "main": [[{ "node": "Nearest Aircraft", "type": "main", "index": 0 }]] },
     "Nearest Aircraft": { "main": [[{ "node": "Aircraft Found?", "type": "main", "index": 0 }]] },
     "Aircraft Found?": {
