@@ -1,0 +1,12 @@
+# Real WiFi credentials -- never commit these
+matrix64/**/secrets.h
+
+# macOS
+.DS_Store
+
+# Arduino build artifacts
+*.hex
+*.bin.build/
+build/
+
+.claude
