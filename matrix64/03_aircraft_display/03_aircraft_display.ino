@@ -114,6 +114,11 @@ int iconCount = 0;
 
 MatrixPanel_I2S_DMA *dma_display = nullptr;
 GFXcanvas16 canvas(PANEL_RES_X, PANEL_RES_Y);
+// Scratch canvas for the beside-icon column (make/modelShort): scrolling
+// long text (e.g. "Avions de Transport Régional" for ATR) is drawn into
+// this narrower buffer first, then blitted -- so it can never sweep across
+// the icon area the way a full-width scroll would.
+GFXcanvas16 rightColCanvas(RIGHT_COL_AVAIL, 8);
 WebServer server(80);
 uint16_t textColor;
 
@@ -241,8 +246,10 @@ void setupNTP() {
 void resetAllScrollPositions() {
   scrollXAirline = PANEL_RES_X;
   scrollXFlightAlt = PANEL_RES_X;
-  scrollXMake = PANEL_RES_X;
-  scrollXModelShort = PANEL_RES_X;
+  // These two scroll within the narrower rightColCanvas, not the full
+  // panel, so they should re-enter from just off ITS right edge.
+  scrollXMake = RIGHT_COL_AVAIL;
+  scrollXModelShort = RIGHT_COL_AVAIL;
   scrollXIata = PANEL_RES_X;
   scrollXCity = PANEL_RES_X;
 }
@@ -385,6 +392,29 @@ void drawScrollIfNeeded(const String &text, int y, int staticX, int availWidth, 
   }
 }
 
+// Same idea as drawScrollIfNeeded(), but for the beside-icon column: text
+// is drawn into rightColCanvas (exactly RIGHT_COL_AVAIL px wide) first,
+// then blitted at (mainX, mainY) -- so a long scrolling name is clipped to
+// the column and never overdraws the icon to its left.
+void drawScrollClipped(const String &text, int mainX, int mainY, int availWidth, int &scrollX) {
+  if (text.length() == 0) return;
+  int textWidthPx = text.length() * 6;
+  rightColCanvas.fillScreen(0);
+  rightColCanvas.setTextSize(1);
+  rightColCanvas.setTextWrap(false);
+  rightColCanvas.setTextColor(textColor);
+  if (textWidthPx <= availWidth) {
+    rightColCanvas.setCursor(0, 0);
+    rightColCanvas.print(text);
+  } else {
+    rightColCanvas.setCursor(scrollX, 0);
+    rightColCanvas.print(text);
+    scrollX--;
+    if (scrollX < -textWidthPx) scrollX = availWidth;
+  }
+  canvas.drawRGBBitmap(mainX, mainY, rightColCanvas.getBuffer(), availWidth, 8);
+}
+
 void drawAircraft() {
   canvas.fillScreen(0);
   canvas.setTextSize(1);
@@ -398,8 +428,8 @@ void drawAircraft() {
   if (iconBuf) {
     canvas.drawRGBBitmap(ICON_X, ICON_Y, iconBuf, ICON_SIZE, ICON_SIZE);
   }
-  drawScrollIfNeeded(lineMake, MAKE_Y, RIGHT_COL_X, RIGHT_COL_AVAIL, scrollXMake);
-  drawScrollIfNeeded(lineModelShort, MODELSHORT_Y, RIGHT_COL_X, RIGHT_COL_AVAIL, scrollXModelShort);
+  drawScrollClipped(lineMake, RIGHT_COL_X, MAKE_Y, RIGHT_COL_AVAIL, scrollXMake);
+  drawScrollClipped(lineModelShort, RIGHT_COL_X, MODELSHORT_Y, RIGHT_COL_AVAIL, scrollXModelShort);
 
   drawScrollIfNeeded(lineIata, IATA_Y, 1, FULL_WIDTH_AVAIL, scrollXIata);
 
