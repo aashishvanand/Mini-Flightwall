@@ -58,7 +58,7 @@ def convert_one(src: Path, size: int) -> bytes:
 
 
 def output_name(src: Path) -> str:
-    stem = src.stem
+    stem = src.stem.lower()
     if not stem.endswith("_logo"):
         stem += "_logo"
     return stem + ".bin"

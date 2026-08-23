@@ -19,6 +19,30 @@
 // then copy icons/*.bin to /icons/ on the SD card (not the raw tailfin/
 // source images -- those are full-size .webp/.png, not decodable on-device).
 //
+// Remote icon sync: syncIcons() GETs manifest.json from ICON_BASE_URL (any
+// S3-compatible bucket or plain HTTPS host works -- no vendor SDK involved)
+// -- a JSON array of {"name", "sha256"} -- and downloads whatever's missing
+// or whose hash changed. Runs twice, via the same function with different
+// persistToSD:
+//   - at boot, right after WiFi connects and before setupMatrix() starts
+//     the DMA (SD is still safe to touch): writes new/updated icons to
+//     /icons/ AND loads them into PSRAM, so they survive next boot even
+//     offline.
+//   - periodically from loop() (every ICON_SYNC_INTERVAL_MS): PSRAM only,
+//     SD is never touched again once the DMA is running (see note above).
+// So a new or updated airline logo shows up within one sync interval with
+// no SD card pull required. Build/upload with tools/sync_icons_r2.sh (an
+// R2-based reference implementation); see README "Remote icon sync".
+// Skipped entirely if ICON_BASE_URL isn't set in secrets.h.
+//
+// Security: every download goes over TLS validated against ESP32's bundled
+// CA root store (setCACertBundle) -- not setInsecure() -- and redirects are
+// disabled, so a MITM or malicious proxy can't swap in a fake cert or
+// redirect the request elsewhere. On top of that, every downloaded icon's
+// SHA-256 is checked against the hash the manifest declared for it (fetched
+// over that same validated connection) before it's written anywhere or
+// shown on the panel; a mismatch is dropped, not displayed.
+//
 // Payload from matrix64_aircraft_workflow.json's Build Payload node:
 //   {
 //     "flight": "SQ123", "airline": "Singapore Airlines",
@@ -60,14 +84,36 @@
 // before building -- secrets.h is gitignored, never commit real creds.
 
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <Adafruit_GFX.h>
 #include <time.h>
+#include <mbedtls/sha256.h>
 #include "FS.h"
 #include "SD_MMC.h"
 #include "secrets.h"
+
+// ESP32 Arduino core's built-in trusted-CA bundle (Mozilla's root store,
+// baked into the firmware at build time) -- used instead of
+// WiFiClientSecure::setInsecure() so icon downloads get real certificate
+// validation. Requires arduino-esp32 core >=2.0 (CONFIG_MBEDTLS_CERTIFICATE_BUNDLE,
+// on by default); see examples/WiFiClientSecure/BuiltinCertBundle in the core.
+extern const uint8_t rootca_crt_bundle_start[] asm("_binary_x509_crt_bundle_start");
+
+// Base URL icons are synced from, e.g. "https://data.airportdata.dev/24x24"
+// (no trailing slash -- <base>/manifest.json and <base>/<name>.bin are
+// fetched directly). Define in secrets.h to enable syncIcons(); left unset
+// here as a no-op default so builds without it configured still compile.
+#ifndef ICON_BASE_URL
+#define ICON_BASE_URL ""
+#endif
+
+// How often loop() re-checks the manifest for new/updated icons while the
+// board is running (PSRAM only -- see syncIcons() below for why).
+#define ICON_SYNC_INTERVAL_MS (3UL * 24 * 60 * 60 * 1000) // 3 days
 
 // Timezone offset from UTC in seconds (edit per location). Default here is
 // IST (UTC+5:30) to match the HOME_LAT/HOME_LON in matrix64_aircraft_workflow.json.
@@ -88,7 +134,10 @@
 #define BSP_SD_CLK 1
 
 #define ICON_SIZE 24
-#define MAX_ICONS 300
+// 319 icons currently ship in icons/ -- MAX_ICONS needs comfortable
+// headroom above that so preloadIcons()/syncIcons() don't silently start
+// dropping entries as more airlines get added.
+#define MAX_ICONS 500
 
 // Layout constants (see header comment above for the row map)
 #define AIRLINE_Y 0
@@ -105,8 +154,12 @@
 #define RIGHT_COL_AVAIL (PANEL_RES_X - RIGHT_COL_X - 1) // beside-icon rows
 
 struct IconEntry {
-  String name;      // filename without extension, e.g. "sq_logo"
+  String name;       // filename without extension, e.g. "sq_logo"
   uint16_t *pixels;  // ICON_SIZE*ICON_SIZE RGB565, PSRAM-allocated
+  uint8_t hash[32];  // SHA-256 of the raw pixel bytes -- lets syncIcons()
+                      // tell "already have this exact icon" apart from
+                      // "have a code by this name but it changed", without
+                      // needing to have originally gotten it from the network.
 };
 
 IconEntry icons[MAX_ICONS];
@@ -143,12 +196,30 @@ String lineCity = "";
 int scrollXCity = PANEL_RES_X;
 
 unsigned long lastScroll = 0;
+unsigned long lastIconSync = 0; // set once at boot; see ICON_SYNC_INTERVAL_MS
+
+int findIconIndex(const String &name) {
+  for (int i = 0; i < iconCount; i++) {
+    if (icons[i].name == name) return i;
+  }
+  return -1;
+}
 
 uint16_t *findIcon(const String &name) {
-  for (int i = 0; i < iconCount; i++) {
-    if (icons[i].name == name) return icons[i].pixels;
+  int idx = findIconIndex(name);
+  return idx >= 0 ? icons[idx].pixels : nullptr;
+}
+
+// Decodes a 64-hex-char string (as manifest.json's "sha256" field) into 32
+// raw bytes. Returns false (and leaves out untouched) on malformed input.
+bool hexToBytes(const String &hex, uint8_t *out, size_t outLen) {
+  if ((size_t)hex.length() != outLen * 2) return false;
+  for (size_t i = 0; i < outLen; i++) {
+    char byteStr[3] = { hex[2 * i], hex[2 * i + 1], 0 };
+    if (!isxdigit((unsigned char)byteStr[0]) || !isxdigit((unsigned char)byteStr[1])) return false;
+    out[i] = (uint8_t)strtoul(byteStr, nullptr, 16);
   }
-  return nullptr;
+  return true;
 }
 
 void preloadIcons() {
@@ -172,6 +243,7 @@ void preloadIcons() {
             f.read((uint8_t *)buf, expectedBytes);
             icons[iconCount].name = fname.substring(0, fname.length() - 4); // strip ".bin"
             icons[iconCount].pixels = buf;
+            mbedtls_sha256((const uint8_t *)buf, expectedBytes, icons[iconCount].hash, 0);
             iconCount++;
           } else {
             Serial.printf("PSRAM alloc failed for %s\n", fname.c_str());
@@ -185,6 +257,141 @@ void preloadIcons() {
     f = dir.openNextFile();
   }
   Serial.printf("Preloaded %d icons from SD into PSRAM\n", iconCount);
+}
+
+// Downloads exactly ICON_SIZE*ICON_SIZE*2 bytes from url into buf and
+// checks its SHA-256 against expectedHash before accepting it. TLS is
+// validated against the ESP32 core's built-in CA bundle (not
+// setInsecure()) and redirects are disabled, so neither a MITM nor a
+// compromised proxy can substitute a different host or a different file --
+// and even if the origin itself served something unexpected, the hash
+// check (computed over the response body, independent of transport) still
+// catches it before it's written to SD or shown on the panel.
+bool downloadAndVerifyIcon(const String &url, uint16_t *buf, const uint8_t *expectedHash) {
+  const size_t expectedBytes = ICON_SIZE * ICON_SIZE * 2;
+
+  WiFiClientSecure client;
+  client.setCACertBundle(rootca_crt_bundle_start);
+  HTTPClient http;
+  http.setTimeout(8000);
+  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+  if (!http.begin(client, url)) return false;
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK || http.getSize() != (int)expectedBytes) {
+    Serial.printf("Icon sync: bad response for %s (HTTP %d, %d bytes)\n", url.c_str(), code, http.getSize());
+    http.end();
+    return false;
+  }
+
+  size_t got = http.getStreamPtr()->readBytes((uint8_t *)buf, expectedBytes);
+  http.end();
+  if (got != expectedBytes) {
+    Serial.printf("Icon sync: short read for %s (%d/%d bytes)\n", url.c_str(), (int)got, (int)expectedBytes);
+    return false;
+  }
+
+  uint8_t actualHash[32];
+  mbedtls_sha256((const uint8_t *)buf, expectedBytes, actualHash, 0);
+  if (memcmp(actualHash, expectedHash, sizeof(actualHash)) != 0) {
+    Serial.printf("Icon sync: hash mismatch for %s -- rejecting (possible tampering or a stale manifest)\n", url.c_str());
+    return false;
+  }
+  return true;
+}
+
+// Fetches manifest.json (a JSON array of {"name","sha256"}, e.g.
+// [{"name":"sq_logo","sha256":"...64 hex chars..."}, ...]) and downloads
+// whichever entries are missing or whose hash doesn't match what's already
+// loaded -- covers both "new airline" and "logo art changed" in one pass.
+//
+// persistToSD must only be true when called before setupMatrix() -- SD
+// access is unreliable once the HUB75 DMA display is running (see header
+// note), so the periodic call from loop() passes false and updates PSRAM
+// only; those updates are re-synced (and then persisted) on the
+// next reboot regardless.
+void syncIcons(bool persistToSD) {
+  if (strlen(ICON_BASE_URL) == 0) {
+    Serial.println("Icon sync: ICON_BASE_URL not set, skipping");
+    return;
+  }
+
+  WiFiClientSecure manifestClient;
+  manifestClient.setCACertBundle(rootca_crt_bundle_start);
+  HTTPClient http;
+  http.setTimeout(8000);
+  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+  if (!http.begin(manifestClient, String(ICON_BASE_URL) + "/manifest.json")) {
+    Serial.println("Icon sync: failed to start manifest request");
+    return;
+  }
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("Icon sync: manifest GET failed (HTTP %d)\n", code);
+    http.end();
+    return;
+  }
+
+  JsonDocument manifest;
+  DeserializationError err = deserializeJson(manifest, http.getStream());
+  http.end();
+  if (err) {
+    Serial.printf("Icon sync: bad manifest JSON (%s)\n", err.c_str());
+    return;
+  }
+
+  const size_t expectedBytes = ICON_SIZE * ICON_SIZE * 2;
+  int added = 0, updated = 0;
+  for (JsonObject entry : manifest.as<JsonArray>()) {
+    String name = entry["name"] | "";
+    String hashHex = entry["sha256"] | "";
+    uint8_t expectedHash[32];
+    if (name.length() == 0 || !hexToBytes(hashHex, expectedHash, sizeof(expectedHash))) continue;
+
+    int idx = findIconIndex(name);
+    if (idx >= 0 && memcmp(icons[idx].hash, expectedHash, sizeof(expectedHash)) == 0) continue; // up to date
+    if (idx < 0 && iconCount >= MAX_ICONS) {
+      Serial.println("Icon sync: MAX_ICONS reached, stopping");
+      break;
+    }
+
+    uint16_t *buf = (uint16_t *)ps_malloc(expectedBytes);
+    if (!buf) {
+      Serial.printf("Icon sync: PSRAM alloc failed for %s\n", name.c_str());
+      continue;
+    }
+    if (!downloadAndVerifyIcon(String(ICON_BASE_URL) + "/" + name + ".bin", buf, expectedHash)) {
+      free(buf);
+      continue;
+    }
+
+    if (persistToSD) {
+      File f = SD_MMC.open("/icons/" + name + ".bin", FILE_WRITE);
+      if (f) {
+        f.write((uint8_t *)buf, expectedBytes);
+        f.close();
+      } else {
+        Serial.printf("Icon sync: SD write failed for %s (keeping it in PSRAM anyway)\n", name.c_str());
+      }
+    }
+
+    if (idx >= 0) {
+      free(icons[idx].pixels);
+      icons[idx].pixels = buf;
+      memcpy(icons[idx].hash, expectedHash, sizeof(expectedHash));
+      updated++;
+      Serial.printf("Icon sync: updated %s\n", name.c_str());
+    } else {
+      icons[iconCount].name = name;
+      icons[iconCount].pixels = buf;
+      memcpy(icons[iconCount].hash, expectedHash, sizeof(expectedHash));
+      iconCount++;
+      added++;
+      Serial.printf("Icon sync: added %s\n", name.c_str());
+    }
+  }
+
+  Serial.printf("Icon sync: %d added, %d updated, %d total\n", added, updated, iconCount);
 }
 
 void setupSD() {
@@ -368,10 +575,15 @@ void setupServer() {
 
 void setup() {
   Serial.begin(115200);
-  setupSD();     // must finish before setupMatrix() -- SD access after the
-                 // HUB75 DMA display starts is unreliable on this board.
+  setupSD();             // must finish before setupMatrix() -- SD access
+                          // after the HUB75 DMA display starts is unreliable
+                          // on this board.
+  setupWiFi();            // needed before the icon sync below; also fine to
+                          // run before setupMatrix() since WiFi doesn't
+                          // touch SD or the panel.
+  syncIcons(true);        // last chance to touch SD before DMA starts
+  lastIconSync = millis(); // next periodic check is ICON_SYNC_INTERVAL_MS from now
   setupMatrix();
-  setupWiFi();
   setupNTP();
   setupServer();
 }
@@ -477,6 +689,15 @@ void drawClock() {
 
 void loop() {
   server.handleClient();
+
+  // Cast to unsigned long makes this subtraction wrap correctly even across
+  // a millis() rollover (~49 days), so this doesn't need its own overflow
+  // handling. PSRAM-only (persistToSD=false): the HUB75 DMA is running by
+  // now, so SD is off-limits until the next reboot re-syncs it there too.
+  if ((unsigned long)(millis() - lastIconSync) >= ICON_SYNC_INTERVAL_MS) {
+    lastIconSync = millis();
+    syncIcons(false);
+  }
 
   bool haveContent = lineAirline.length() || lineFlightAlt.length() || lineMake.length() ||
                       lineModelShort.length() || lineIata.length() || lineCity.length();

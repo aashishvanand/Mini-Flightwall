@@ -13,3 +13,6 @@ matrix64/**/secrets.h
 build/
 
 .claude
+.wrangler
+
+tools/*.sh

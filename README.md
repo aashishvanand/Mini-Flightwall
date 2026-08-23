@@ -105,6 +105,8 @@ cp secrets.h.example secrets.h
 
 Icons are 24×24 raw RGB565 pixel dumps — no file header, 1,152 bytes each — because that's the simplest format the ESP32 can load straight into a `uint16_t` buffer with no decoding at runtime. `icons/` in this repo already has the pre-converted `.bin` files for a couple hundred airline codes; copy the ones you need onto the SD card under `/icons/`. The filename (minus `.bin`) is the `icon` key sent in the JSON payload, e.g. `sq_logo.bin` for Singapore Airlines.
 
+The n8n workflow's **Build Payload** node resolves which icon to send: it tries the airline's IATA code first, falls back to its ICAO code if there's no icon for the IATA (or no IATA at all, e.g. military/cargo callsigns), and falls back to `00_logo` (a blank tail) if neither has one — so a missing icon reads as "no art yet" instead of a stale or wrong logo. That node keeps a hardcoded `AVAILABLE_ICONS` set of every code currently in `icons/`; regenerate it (`ls icons | sed 's/_logo\.bin$//' | sort`) and paste it back in whenever you add or remove icons.
+
 To add or regenerate icons from source logo images (`.webp`, `.png`, `.jpg`):
 
 ```bash
@@ -113,6 +115,35 @@ python3 tools/convert_tiles.py --input logos/ --size 24 --format raw565 --output
 ```
 
 This resizes each source image to fit a 24×24 canvas (letterboxed on a black background — the panel's "off" color), converts it to RGB565, and writes `<name>_logo.bin` per source file. See `tools/convert_tiles.py --help` for options.
+
+#### Remote icon sync
+
+New or updated icons reach the board without pulling the SD card and re-flashing it by hand. Icons are hosted as static files on any S3-compatible object storage (or really, anything served over plain HTTPS) — the firmware just does a `GET`, no vendor SDK or API involved:
+
+- **At boot**, right after WiFi connects and before the HUB75 DMA starts (the SD card is unreliable once it's running), `syncIcons(true)` GETs `manifest.json` from `ICON_BASE_URL`, downloads whatever's missing or changed, writes it to `/icons/` on the SD card, and loads it into PSRAM.
+- **Every `ICON_SYNC_INTERVAL_MS`** (3 days by default) while running, `loop()` calls `syncIcons(false)` — same manifest diff, but PSRAM-only, since SD can't be touched once the display's DMA is active. Those updates get persisted to SD on the next reboot regardless.
+
+`manifest.json` is a JSON array of `{"name", "sha256"}` — the SHA-256 lets the firmware tell "already have this" apart from "have a file by this name but the art changed," and download only what's actually different.
+
+**Security against a MITM or malicious proxy:** every request validates the server's TLS certificate against the ESP32 core's built-in CA bundle (`setCACertBundle`, not `setInsecure()`) and disables HTTP redirects, so a network attacker can't substitute a different host or downgrade the connection. On top of that, every downloaded icon's SHA-256 is checked against the hash the manifest declared for it — fetched over that same validated connection — before it's written to SD or shown on the panel; a mismatch is dropped silently rather than displayed. This also means a compromised object (even one served with a technically-valid cert) gets caught by the hash check as long as the manifest itself wasn't tampered with in the same request.
+
+In `matrix64/03_aircraft_display/secrets.h`, set `ICON_BASE_URL` to `<base>/<prefix>` (no trailing slash) — `<base>/manifest.json` and `<base>/<name>.bin` must both resolve. Leaving it unset skips the sync entirely — the SD card's existing icons still work. This value is public info (it's just a URL your board fetches from over plain HTTPS) but stays out of the repo since it lives in the gitignored `secrets.h`, not `secrets.h.example`.
+
+Any S3-compatible bucket with public HTTPS access works — Cloudflare R2, AWS S3, MinIO, Backblaze B2, etc. `tools/sync_icons_r2.sh` is the reference implementation, using R2 (chosen for free egress and an S3-compatible API):
+
+1. `wrangler login`, then `wrangler r2 bucket create <bucket-name>`.
+2. In the Cloudflare dashboard, open the bucket → **Settings** → **Public access** → **Allow Access**, and copy the `r2.dev` URL, or attach a custom domain (e.g. `data.airportdata.dev`).
+3. Set `ICON_BASE_URL` as described above.
+
+Whenever `icons/` changes:
+
+```bash
+./tools/sync_icons_r2.sh <bucket-name> [prefix]
+```
+
+`prefix` defaults to `24x24` to match the layout above; pass `""` to upload to the bucket root instead. This uploads every `icons/*.bin` plus a `manifest.json` with each one's SHA-256. New/changed icons show up within one sync interval; reboot to pick them up immediately. On a different S3-compatible provider, upload the same `icons/*.bin` files plus a matching `manifest.json` (name + sha256 per file) however that provider's tooling works (`aws s3 cp`, `mc mirror`, rclone, etc.) — the firmware doesn't care how the files got there, only that they're reachable over HTTPS at `ICON_BASE_URL`.
+
+Object storage was chosen over Cloudflare Images because the `.bin` files are headerless raw RGB565 dumps, not a format Images can store or serve — Images is built for re-encoding/serving actual photos, not arbitrary binary blobs.
 
 ## n8n workflow setup
 
