@@ -40,7 +40,6 @@ You'll also need:
 
 ```
 matrix64/
-  02_http_display/        WiFi HTTP Text Display -- bring-up firmware
   03_aircraft_display/    Aircraft Overhead Display -- production firmware
 icons/                    Preprocessed 24x24 raw RGB565 airline-logo icons (copy to SD card /icons)
 tools/
@@ -73,8 +72,9 @@ The driver board's GPIO wiring to the panel and SD card is fixed by Waveshare an
 3. Select the board: **Tools > Board > esp32 > ESP32S3 Dev Module**.
 4. Under **Tools**, set:
    - **USB CDC On Boot**: Enabled (so Serial Monitor works over USB-C without a separate UART adapter)
-   - **PSRAM**: OPI PSRAM (the icon cache and the off-screen canvas live in PSRAM — required for Aircraft Overhead Display)
-   - **Partition Scheme**: a scheme with enough app space for the libraries below (Default 4MB with spiffs is fine for both sketches)
+   - **PSRAM**: OPI PSRAM (the icon cache and the off-screen canvas live in PSRAM — required for Aircraft Overhead Display). This board (Waveshare's ESP32-S3-N32R16 driver board) has 16MB of Octal PSRAM, which is what "OPI" refers to.
+   - **Flash Size**: **32MB (256Mb)** — this board's chip is the N32R16 variant (32MB flash, 16MB PSRAM). The IDE's default is 4MB regardless of board choice; leaving it on the default doesn't break anything (the firmware still fits fine either way), it just leaves ~28MB of the chip's actual flash completely unpartitioned and unusable.
+   - **Partition Scheme**: **32M Flash (4.8MB APP/22MB FATFS)** — pick this only after Flash Size above is set to 32MB (a 32MB-sized partition table on a board set to 4MB will fail to flash). Gives 4.8MB of app space instead of ~1.2MB, comfortable headroom for the admin web console and anything added to it later. The 22MB FATFS partition goes unused (icons live on the SD card via SD_MMC, config in NVS/Preferences) — it's just what this scheme bundles; a "no FS" 32MB scheme would be marginally more correct but isn't offered by the IDE's ESP32S3 board definitions as of this writing.
    - **Port**: whichever `/dev/cu.usbmodem*` (macOS) or `COM*` (Windows) appears when the board is plugged in
 5. Install libraries via **Tools > Manage Libraries**:
    - `ESP32 HUB75 LED MATRIX PANEL DMA Display` by mrfaptastic
@@ -86,11 +86,8 @@ Double-check board-specific settings (exact partition scheme, PSRAM mode) agains
 
 ## Firmware setup
 
-Build in order — don't skip straight to the production firmware without first confirming the bring-up firmware works on your panel/board/power combo.
-
-1. **Panel bring-up test** (not included here): run Waveshare's own stock examples (`01_SimpleTestShapes` / `07_Pixel_Mapping_Test`) with `PANEL_RES_Y` changed to 64, to confirm the panel lights up correctly before writing any custom code.
-2. **WiFi HTTP Text Display** — `matrix64/02_http_display`: WiFi + a bare HTTP endpoint that scrolls posted text across the panel. Confirms networking and the double-buffer/flip drawing pattern.
-3. **Aircraft Overhead Display** — `matrix64/03_aircraft_display`: the production firmware — preloads airline icons from SD into PSRAM at boot, renders the aircraft layout, and falls back to an NTP clock when idle. Also serves `/debug/screenshot.bmp` so you can see exactly what's on the panel from a browser, no camera needed.
+1. **Panel bring-up test** (not included here): run Waveshare's own stock examples (`01_SimpleTestShapes` / `07_Pixel_Mapping_Test`) with `PANEL_RES_Y` changed to 64, to confirm the panel lights up correctly before writing any custom code. An earlier bring-up sketch of our own (`matrix64/02_http_display` -- WiFi + a bare HTTP endpoint, validating networking and the double-buffer/flip drawing pattern) has since been removed now that the production firmware is working end-to-end; those config decisions (panel driver, GPIO wiring, buffer-flip timing) are documented inline in `03_aircraft_display.ino` instead.
+2. **Aircraft Overhead Display** — `matrix64/03_aircraft_display`: the production firmware — preloads airline icons from SD into PSRAM at boot, renders the aircraft layout, and falls back to an NTP clock when idle. Also serves `/debug/screenshot.bmp` so you can see exactly what's on the panel from a browser, no camera needed.
 
 For each sketch:
 
@@ -110,22 +107,30 @@ The n8n workflow's **Build Payload** node resolves which icon to send: it tries 
 To add or regenerate icons from source logo images (`.webp`, `.png`, `.jpg`):
 
 ```bash
-pip install pillow
-python3 tools/convert_tiles.py --input logos/ --size 24 --format raw565 --output icons
+python3 -m venv venv && venv/bin/pip install pillow numpy
+venv/bin/python tools/convert_tiles.py --input logos/ --size 24 --format raw565 --output icons
 ```
 
-This resizes each source image to fit a 24×24 canvas (letterboxed on a black background — the panel's "off" color), converts it to RGB565, and writes `<name>_logo.bin` per source file. See `tools/convert_tiles.py --help` for options.
+Uses emblem-focus detection (crops tightly around the actual logo mark -- birds, cranes, flags, kapok flowers -- so it fills most of the 24x24 tile instead of sitting small in a plain letterboxed square), unsharp masking, and a two-pass downscale before writing RGB565, `<name>_logo.bin` per source file. Ported from the [Ulanzi Feeder](../Ulanzi%20Feeder) repo's 8x8 AWTRIX converter -- see `tools/convert_tiles.py --help` for options.
+
+Three ways a new or changed icon reaches the board, in increasing order of how "permanent" the change is meant to be:
+
+1. **Admin console upload** (`http://<board-ip>/`, Icons section) -- fastest for a one-off fix, shows on the panel immediately. See "Icon upload via the admin console" further down.
+2. **Remote sync** (below) -- the way to roll out a whole icon-set update (e.g. after a `convert_tiles.py` regeneration) without pulling the SD card by hand.
+3. **Pull the SD card and copy `icons/*.bin` onto it directly** -- always works, no network dependency, but means physically accessing the board.
+
+All three end up in the same place: SD's `/icons/` is the durable source of truth `preloadIcons()` reads at boot, regardless of which path got a file there.
 
 #### Remote icon sync
 
-New or updated icons reach the board without pulling the SD card and re-flashing it by hand. Icons are hosted as static files on any S3-compatible object storage (or really, anything served over plain HTTPS) — the firmware just does a `GET`, no vendor SDK or API involved:
+Icons are hosted as static files on any S3-compatible object storage (or really, anything served over plain HTTPS) — the firmware just does a `GET`, no vendor SDK or API involved:
 
 - **At boot**, right after WiFi connects and before the HUB75 DMA starts (the SD card is unreliable once it's running), `syncIcons(true)` GETs `manifest.json` from `ICON_BASE_URL`, downloads whatever's missing or changed, writes it to `/icons/` on the SD card, and loads it into PSRAM.
 - **Every `ICON_SYNC_INTERVAL_MS`** (3 days by default) while running, `loop()` calls `syncIcons(false)` — same manifest diff, but PSRAM-only, since SD can't be touched once the display's DMA is active. Those updates get persisted to SD on the next reboot regardless.
 
 `manifest.json` is a JSON array of `{"name", "sha256"}` — the SHA-256 lets the firmware tell "already have this" apart from "have a file by this name but the art changed," and download only what's actually different.
 
-**Security against a MITM or malicious proxy:** every request validates the server's TLS certificate against the ESP32 core's built-in CA bundle (`setCACertBundle`, not `setInsecure()`) and disables HTTP redirects, so a network attacker can't substitute a different host or downgrade the connection. On top of that, every downloaded icon's SHA-256 is checked against the hash the manifest declared for it — fetched over that same validated connection — before it's written to SD or shown on the panel; a mismatch is dropped silently rather than displayed. This also means a compromised object (even one served with a technically-valid cert) gets caught by the hash check as long as the manifest itself wasn't tampered with in the same request.
+**Security against a MITM or malicious proxy:** every request validates the server's TLS certificate against the ESP32 core's built-in CA bundle (`useBuiltinCACertBundle()`, not `setInsecure()`) and disables HTTP redirects, so a network attacker can't substitute a different host or downgrade the connection. On top of that, every downloaded icon's SHA-256 is checked against the hash the manifest declared for it — fetched over that same validated connection — before it's written to SD or shown on the panel; a mismatch is dropped silently rather than displayed. This also means a compromised object (even one served with a technically-valid cert) gets caught by the hash check as long as the manifest itself wasn't tampered with in the same request.
 
 In `matrix64/03_aircraft_display/secrets.h`, set `ICON_BASE_URL` to `<base>/<prefix>` (no trailing slash) — `<base>/manifest.json` and `<base>/<name>.bin` must both resolve. Leaving it unset skips the sync entirely — the SD card's existing icons still work. This value is public info (it's just a URL your board fetches from over plain HTTPS) but stays out of the repo since it lives in the gitignored `secrets.h`, not `secrets.h.example`.
 
@@ -189,9 +194,77 @@ Then activate it. It polls every 30 seconds, finds the nearest airborne aircraft
 
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/api/display` | POST | Push a new display payload (JSON) |
-| `/api/clear` | POST | Clear the display, fall back to clock (Aircraft Overhead Display) or blank (WiFi HTTP Text Display) |
-| `/debug/screenshot.bmp` | GET | Aircraft Overhead Display only — returns the current frame as a BMP |
+| `/api/display` | POST | Push a new display payload (JSON) -- this is what the n8n workflow calls every 30s |
+| `/api/clear` | POST | Clear the display, fall back to the NTP clock |
+| `/debug/screenshot.bmp` | GET | Returns the current frame as a BMP -- no camera needed to see what's on the panel |
+
+The endpoints below back the admin web console at `http://<board-ip>/` (see
+"Admin web console" below) -- none of them need to be called directly for
+normal operation, they exist for the page's own JS to call.
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/` | GET | Admin dashboard -- live preview, status, icon browser, WiFi scan, config, log, reboot, firmware update |
+| `/api/status` | GET | JSON status snapshot (uptime, heap/PSRAM, WiFi, icon count, current config, what's showing) |
+| `/api/config` | POST | Update hostname / brightness / manual timezone override (form-encoded, persisted to NVS) |
+| `/api/reboot` | POST | Reboot the board |
+| `/api/log` | GET | Tail of the in-memory log ring buffer (plain text) |
+| `/api/icons` | GET | JSON array of every icon name currently loaded in PSRAM |
+| `/api/icon.bmp?name=<n>` | GET | A single icon's pixels as a BMP (for the admin page's icon grid) |
+| `/api/icons/delete?name=<n>` | POST | Remove an icon from PSRAM now; actually deleted from the SD card on next reboot (SD can't be touched while the display's DMA is running -- see "Icons" above) |
+| `/api/icons/upload` | POST | Upload a 24x24 raw565 `.bin` (multipart/form-data) -- stages to internal flash (FATFS, no DMA-unsafe window), loads into PSRAM immediately, merged onto the SD card on next reboot. See "Icon upload via the admin console" below |
+| `/api/wifi/scan` | GET | JSON list of nearby SSIDs (blocks ~1-2s; the panel's scroll will visibly pause) |
+| `/api/ota` | POST | Flash a new firmware `.bin` (multipart/form-data) and reboot into it. **No authentication** -- see "OTA firmware updates" below before relying on this |
+
+## Admin web console
+
+`http://<board-ip>/` -- a live dashboard, not just a status page: the panel
+preview and status numbers auto-refresh via JS polling `/api/status` and
+`/debug/screenshot.bmp` (no need to reload the page). From it you can browse
+and delete loaded icons, upload new ones, scan for WiFi networks, watch the
+live log, edit hostname/brightness/timezone-override, reboot, and flash new
+firmware -- all documented in the API table above.
+
+Like every other endpoint on this board, the console has **no
+authentication** -- it trusts the LAN the same way `/api/display` always
+has. That's an explicit, accepted tradeoff for a board that's meant to
+never be exposed to the WAN, not an oversight; see "OTA firmware updates"
+below for where that tradeoff carries more weight than usual.
+
+### Icon upload via the admin console
+
+Upload a `.bin` produced by `tools/convert_tiles.py` (exactly 1,152 bytes --
+24x24 raw565, same format as everything on the SD card) through the Icons
+section of `/`. It's staged to a `/pending` directory on the board's
+internal flash (FATFS, mounted from the 32MB partition scheme's `ffat`
+partition -- see "Arduino IDE setup") rather than the SD card, because
+internal flash has no DMA-unsafe window the way SD_MMC does: it can be
+written to at any time, including while the display is actively running.
+
+The upload shows on the panel immediately (loaded straight into PSRAM), but
+`/pending` is intentionally not the icon's permanent home -- on the *next*
+boot, before `preloadIcons()` runs, every file in `/pending` is copied into
+SD's `/icons/` (overwriting any existing file of the same name -- last
+upload wins) and then deleted from `/pending`. SD stays the single durable
+copy of record, same as it's always been for icons that arrive via the R2
+remote-sync path; uploaded icons just take one extra boot to actually land
+there instead of being written to SD directly.
+
+### OTA firmware updates
+
+The Firmware update section of `/` accepts a compiled `.bin` (Arduino IDE:
+**Sketch > Export Compiled Binary**, or `arduino-cli compile --output-dir
+<dir>`) and flashes it to the board's spare `ota_0`/`ota_1` app partition
+(the 32MB scheme's partitions both being ~4.5MB is what makes this
+practical -- see "Arduino IDE setup"), rebooting into it automatically on
+success.
+
+This is meaningfully riskier than every other unauthenticated endpoint on
+this board: a bad `/api/display` push shows a wrong flight number, but a
+bad `/api/ota` push replaces the firmware. It's accepted on the same
+LAN-only trust model the rest of this project already uses, not because the
+stakes are actually lower here -- they aren't. Don't expose this board's
+HTTP port beyond your LAN.
 
 ## License
 

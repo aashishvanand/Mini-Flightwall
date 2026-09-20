@@ -1,10 +1,10 @@
 // Aircraft Overhead Display -- production firmware for the Waveshare
 // ESP32-S3-RGB-Matrix board driving a 64x64 HUB75 panel.
 //
-// Only run this AFTER the WiFi HTTP Text Display firmware
-// (matrix64/02_http_display) is confirmed working -- same panel config,
-// same double-buffer/flip pattern, this just adds SD icon loading and a
-// richer JSON payload/layout on top.
+// Run Waveshare's own stock panel examples first (see README "Firmware
+// setup") to confirm the panel itself lights up correctly before this --
+// this sketch adds SD icon loading and a richer JSON payload/layout on top
+// of the same panel config and double-buffer/flip pattern validated there.
 //
 // SD card handling: Waveshare's own 05_AnimatedGIFPanel_SD example flags
 // (in a code comment) that the TF card becomes unreliable once the HUB75
@@ -36,7 +36,7 @@
 // Skipped entirely if ICON_BASE_URL isn't set in secrets.h.
 //
 // Security: every download goes over TLS validated against ESP32's bundled
-// CA root store (setCACertBundle) -- not setInsecure() -- and redirects are
+// CA root store (useBuiltinCACertBundle()) -- not setInsecure() -- and redirects are
 // disabled, so a MITM or malicious proxy can't swap in a fake cert or
 // redirect the request elsewhere. On top of that, every downloaded icon's
 // SHA-256 is checked against the hash the manifest declared for it (fetched
@@ -73,12 +73,14 @@
 //           (airframe age would go here too, but no data source has it --
 //           adsbdb's /v0/aircraft/{icao24} has no build-date field)
 //  y 41-48: IATA route codes, full width, e.g. "SIN>KUL"
-//  y 49-56: origin -> destination city names (ALWAYS scrolling)
+//  y 48-64: origin -> destination city names, 2x text size (ALWAYS
+//           scrolling) -- fills to the panel's bottom edge exactly
 //
 // Libraries required (Arduino Library Manager):
 //   - "ESP32 HUB75 LED MATRIX PANEL DMA Display" by mrfaptastic
 //   - "ArduinoJson" by Benoit Blanchon
-// (WebServer.h, FS.h, SD_MMC.h all ship with the esp32 core -- no install)
+// (WebServer.h, FS.h, SD_MMC.h, Preferences.h all ship with the esp32 core
+// -- no install)
 //
 // Copy secrets.h.example to secrets.h and fill in your WiFi credentials
 // before building -- secrets.h is gitignored, never commit real creds.
@@ -94,14 +96,56 @@
 #include <mbedtls/sha256.h>
 #include "FS.h"
 #include "SD_MMC.h"
+#include "FFat.h"
+#include <Update.h>
+#include <Preferences.h>
 #include "secrets.h"
+
+// Every Serial.print*() call in this file goes through consoleLog instead
+// (see the class below) -- same output over USB Serial, plus a ring buffer
+// so the admin page's log viewer (GET /api/log) can show the tail of it
+// without a separate UART reader. Print's own printf/print/println are
+// implemented in terms of write(), so overriding just write() here gets
+// every existing call site working via a simple s/Serial\./consoleLog./
+// rename, no call-site rewrites needed.
+#define LOG_BUFFER_SIZE 4096
+class Logger : public Print {
+public:
+  void begin(unsigned long baud) { Serial.begin(baud); }
+  size_t write(uint8_t c) override {
+    buf[head] = c;
+    head = (head + 1) % LOG_BUFFER_SIZE;
+    if (count < LOG_BUFFER_SIZE) count++;
+    return Serial.write(c);
+  }
+  using Print::write; // pulls in the (const uint8_t*, size_t) overload, which
+                       // Print implements as a loop over write(uint8_t) above
+
+  // Returns the buffered log in chronological order (oldest first).
+  String getTail() {
+    String out;
+    out.reserve(count);
+    size_t start = (count < LOG_BUFFER_SIZE) ? 0 : head;
+    for (size_t i = 0; i < count; i++) {
+      out += buf[(start + i) % LOG_BUFFER_SIZE];
+    }
+    return out;
+  }
+
+private:
+  char buf[LOG_BUFFER_SIZE];
+  size_t head = 0;
+  size_t count = 0;
+};
+Logger consoleLog;
 
 // ESP32 Arduino core's built-in trusted-CA bundle (Mozilla's root store,
 // baked into the firmware at build time) -- used instead of
 // WiFiClientSecure::setInsecure() so icon downloads get real certificate
 // validation. Requires arduino-esp32 core >=2.0 (CONFIG_MBEDTLS_CERTIFICATE_BUNDLE,
-// on by default); see examples/WiFiClientSecure/BuiltinCertBundle in the core.
-extern const uint8_t rootca_crt_bundle_start[] asm("_binary_x509_crt_bundle_start");
+// on by default). NetworkClientSecure::useBuiltinCACertBundle() attaches it
+// directly -- no manual symbol/size plumbing needed (core >=3.x removed the
+// single-arg setCACertBundle(bundle) overload this used to call).
 
 // Base URL icons are synced from, e.g. "https://data.airportdata.dev/24x24"
 // (no trailing slash -- <base>/manifest.json and <base>/<name>.bin are
@@ -115,10 +159,13 @@ extern const uint8_t rootca_crt_bundle_start[] asm("_binary_x509_crt_bundle_star
 // board is running (PSRAM only -- see syncIcons() below for why).
 #define ICON_SYNC_INTERVAL_MS (3UL * 24 * 60 * 60 * 1000) // 3 days
 
-// Timezone offset from UTC in seconds (edit per location). Default here is
-// SGT (UTC+8) to match the HOME_LAT/HOME_LON in matrix64_aircraft_workflow.json.
-#define TIMEZONE_OFFSET_SEC 28800
-#define DAYLIGHT_OFFSET_SEC 0
+// Timezone offset from UTC in seconds. This is now resolved automatically at
+// boot via IP-geolocation (fetchTimezoneOffset(), called from setupNTP()) --
+// no more reflashing just because the board moved to a new HOME_LAT/HOME_LON.
+// SGT (UTC+8) is kept only as the fallback if that lookup fails (offline,
+// API down, etc.) -- matches the HOME_LAT/HOME_LON in
+// matrix64_aircraft_workflow.json as of this build.
+#define TIMEZONE_OFFSET_SEC_FALLBACK 28800
 
 #define PANEL_RES_X 64
 #define PANEL_RES_Y 64
@@ -147,8 +194,17 @@ extern const uint8_t rootca_crt_bundle_start[] asm("_binary_x509_crt_bundle_star
 #define RIGHT_COL_X (ICON_SIZE + 2)
 #define MAKE_Y (ICON_Y + 4)
 #define MODELSHORT_Y (ICON_Y + 14)
-#define IATA_Y (ICON_Y + ICON_SIZE + 1)  // 41
-#define CITY_Y (IATA_Y + 8)              // 49
+// IATA_Y was ICON_Y+ICON_SIZE+1 (41), an 8px row ending at 48, which used to
+// leave a 1px gap before the old CITY_Y=49. Now that CITY_Y is 48 (see
+// below), that 1px gap became a 1-row overlap instead -- pulled back to the
+// icon's bottom edge with no gap (40) to clear it, rather than nudging
+// CITY_Y down and re-opening the dead-space gap the drawAircraft() comment
+// below explains.
+#define IATA_Y (ICON_Y + ICON_SIZE)  // 40
+// City row is drawn at 2x text size (16px tall, not 8) -- see drawAircraft()
+// -- so it lands exactly at the panel's bottom edge (48+16=64) instead of
+// leaving a 7px dead gap below an 8px row at the old CITY_Y=49.
+#define CITY_Y 48
 
 #define FULL_WIDTH_AVAIL (PANEL_RES_X - 2)     // full-width rows, 1px margin each side
 #define RIGHT_COL_AVAIL (PANEL_RES_X - RIGHT_COL_X - 1) // beside-icon rows
@@ -175,7 +231,34 @@ GFXcanvas16 rightColCanvas(RIGHT_COL_AVAIL, 8);
 WebServer server(80);
 uint16_t textColor;
 
+// Runtime-configurable settings (Preferences/NVS namespace "mf") -- separate
+// from secrets.h, which only ever holds WiFi creds + ICON_BASE_URL and is
+// meant to be edited/reflashed by hand. These are meant to be changed live
+// via the admin page (GET/POST /) without a reflash: seeded from sensible
+// defaults on first boot, then read back from NVS on every boot after.
+Preferences prefs;
+String cfgHostname;          // WiFi.setHostname() -- takes effect on next boot
+uint8_t cfgBrightness;       // dma_display->setBrightness8() -- live immediately
+bool cfgTzOverrideEnabled;   // true = skip fetchTimezoneOffset(), use cfgTzOverrideOffsetSec
+long cfgTzOverrideOffsetSec; // manual UTC offset in seconds, only used if the above is true
+
+#define DEFAULT_HOSTNAME "miniflightwall"
+#define DEFAULT_BRIGHTNESS 60
+
+void loadConfig() {
+  prefs.begin("mf", false); // false = read/write
+  cfgHostname = prefs.getString("hostname", DEFAULT_HOSTNAME);
+  cfgBrightness = prefs.getUChar("brightness", DEFAULT_BRIGHTNESS);
+  cfgTzOverrideEnabled = prefs.getBool("tzOverride", false);
+  cfgTzOverrideOffsetSec = prefs.getLong("tzOffsetSec", TIMEZONE_OFFSET_SEC_FALLBACK);
+}
+
 String currentIcon = "";
+// Resolved once per /api/display push (handleDisplay) instead of re-scanning
+// the up-to-500-entry icons[] array by name every frame in drawAircraft() --
+// the icon only changes on a push, not on every ~25ms scroll tick, so the
+// old per-frame findIcon() call was pure wasted CPU at the ~40Hz redraw rate.
+uint16_t *currentIconBuf = nullptr;
 
 // Conditionally-scrolling lines: static if they fit their row's available
 // width, scroll only if they don't. Each needs its own scrollX so an
@@ -225,7 +308,7 @@ bool hexToBytes(const String &hex, uint8_t *out, size_t outLen) {
 void preloadIcons() {
   File dir = SD_MMC.open("/icons");
   if (!dir || !dir.isDirectory()) {
-    Serial.println("No /icons directory found on SD card -- icons will be blank");
+    consoleLog.println("No /icons directory found on SD card -- icons will be blank");
     return;
   }
 
@@ -246,17 +329,17 @@ void preloadIcons() {
             mbedtls_sha256((const uint8_t *)buf, expectedBytes, icons[iconCount].hash, 0);
             iconCount++;
           } else {
-            Serial.printf("PSRAM alloc failed for %s\n", fname.c_str());
+            consoleLog.printf("PSRAM alloc failed for %s\n", fname.c_str());
           }
         } else {
-          Serial.printf("Skipping %s: %d bytes, expected %d (not a %dx%d raw565 icon)\n",
+          consoleLog.printf("Skipping %s: %d bytes, expected %d (not a %dx%d raw565 icon)\n",
                          fname.c_str(), (int)f.size(), (int)expectedBytes, ICON_SIZE, ICON_SIZE);
         }
       }
     }
     f = dir.openNextFile();
   }
-  Serial.printf("Preloaded %d icons from SD into PSRAM\n", iconCount);
+  consoleLog.printf("Preloaded %d icons from SD into PSRAM\n", iconCount);
 }
 
 // Downloads exactly ICON_SIZE*ICON_SIZE*2 bytes from url into buf and
@@ -271,7 +354,7 @@ bool downloadAndVerifyIcon(const String &url, uint16_t *buf, const uint8_t *expe
   const size_t expectedBytes = ICON_SIZE * ICON_SIZE * 2;
 
   WiFiClientSecure client;
-  client.setCACertBundle(rootca_crt_bundle_start);
+  client.useBuiltinCACertBundle();
   HTTPClient http;
   http.setTimeout(8000);
   http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
@@ -279,7 +362,7 @@ bool downloadAndVerifyIcon(const String &url, uint16_t *buf, const uint8_t *expe
 
   int code = http.GET();
   if (code != HTTP_CODE_OK || http.getSize() != (int)expectedBytes) {
-    Serial.printf("Icon sync: bad response for %s (HTTP %d, %d bytes)\n", url.c_str(), code, http.getSize());
+    consoleLog.printf("Icon sync: bad response for %s (HTTP %d, %d bytes)\n", url.c_str(), code, http.getSize());
     http.end();
     return false;
   }
@@ -287,14 +370,14 @@ bool downloadAndVerifyIcon(const String &url, uint16_t *buf, const uint8_t *expe
   size_t got = http.getStreamPtr()->readBytes((uint8_t *)buf, expectedBytes);
   http.end();
   if (got != expectedBytes) {
-    Serial.printf("Icon sync: short read for %s (%d/%d bytes)\n", url.c_str(), (int)got, (int)expectedBytes);
+    consoleLog.printf("Icon sync: short read for %s (%d/%d bytes)\n", url.c_str(), (int)got, (int)expectedBytes);
     return false;
   }
 
   uint8_t actualHash[32];
   mbedtls_sha256((const uint8_t *)buf, expectedBytes, actualHash, 0);
   if (memcmp(actualHash, expectedHash, sizeof(actualHash)) != 0) {
-    Serial.printf("Icon sync: hash mismatch for %s -- rejecting (possible tampering or a stale manifest)\n", url.c_str());
+    consoleLog.printf("Icon sync: hash mismatch for %s -- rejecting (possible tampering or a stale manifest)\n", url.c_str());
     return false;
   }
   return true;
@@ -312,22 +395,22 @@ bool downloadAndVerifyIcon(const String &url, uint16_t *buf, const uint8_t *expe
 // next reboot regardless.
 void syncIcons(bool persistToSD) {
   if (strlen(ICON_BASE_URL) == 0) {
-    Serial.println("Icon sync: ICON_BASE_URL not set, skipping");
+    consoleLog.println("Icon sync: ICON_BASE_URL not set, skipping");
     return;
   }
 
   WiFiClientSecure manifestClient;
-  manifestClient.setCACertBundle(rootca_crt_bundle_start);
+  manifestClient.useBuiltinCACertBundle();
   HTTPClient http;
   http.setTimeout(8000);
   http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
   if (!http.begin(manifestClient, String(ICON_BASE_URL) + "/manifest.json")) {
-    Serial.println("Icon sync: failed to start manifest request");
+    consoleLog.println("Icon sync: failed to start manifest request");
     return;
   }
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
-    Serial.printf("Icon sync: manifest GET failed (HTTP %d)\n", code);
+    consoleLog.printf("Icon sync: manifest GET failed (HTTP %d)\n", code);
     http.end();
     return;
   }
@@ -336,7 +419,7 @@ void syncIcons(bool persistToSD) {
   DeserializationError err = deserializeJson(manifest, http.getStream());
   http.end();
   if (err) {
-    Serial.printf("Icon sync: bad manifest JSON (%s)\n", err.c_str());
+    consoleLog.printf("Icon sync: bad manifest JSON (%s)\n", err.c_str());
     return;
   }
 
@@ -351,13 +434,13 @@ void syncIcons(bool persistToSD) {
     int idx = findIconIndex(name);
     if (idx >= 0 && memcmp(icons[idx].hash, expectedHash, sizeof(expectedHash)) == 0) continue; // up to date
     if (idx < 0 && iconCount >= MAX_ICONS) {
-      Serial.println("Icon sync: MAX_ICONS reached, stopping");
+      consoleLog.println("Icon sync: MAX_ICONS reached, stopping");
       break;
     }
 
     uint16_t *buf = (uint16_t *)ps_malloc(expectedBytes);
     if (!buf) {
-      Serial.printf("Icon sync: PSRAM alloc failed for %s\n", name.c_str());
+      consoleLog.printf("Icon sync: PSRAM alloc failed for %s\n", name.c_str());
       continue;
     }
     if (!downloadAndVerifyIcon(String(ICON_BASE_URL) + "/" + name + ".bin", buf, expectedHash)) {
@@ -371,7 +454,7 @@ void syncIcons(bool persistToSD) {
         f.write((uint8_t *)buf, expectedBytes);
         f.close();
       } else {
-        Serial.printf("Icon sync: SD write failed for %s (keeping it in PSRAM anyway)\n", name.c_str());
+        consoleLog.printf("Icon sync: SD write failed for %s (keeping it in PSRAM anyway)\n", name.c_str());
       }
     }
 
@@ -380,41 +463,148 @@ void syncIcons(bool persistToSD) {
       icons[idx].pixels = buf;
       memcpy(icons[idx].hash, expectedHash, sizeof(expectedHash));
       updated++;
-      Serial.printf("Icon sync: updated %s\n", name.c_str());
+      consoleLog.printf("Icon sync: updated %s\n", name.c_str());
     } else {
       icons[iconCount].name = name;
       icons[iconCount].pixels = buf;
       memcpy(icons[iconCount].hash, expectedHash, sizeof(expectedHash));
       iconCount++;
       added++;
-      Serial.printf("Icon sync: added %s\n", name.c_str());
+      consoleLog.printf("Icon sync: added %s\n", name.c_str());
     }
   }
 
-  Serial.printf("Icon sync: %d added, %d updated, %d total\n", added, updated, iconCount);
+  consoleLog.printf("Icon sync: %d added, %d updated, %d total\n", added, updated, iconCount);
+}
+
+// Actually deletes, from SD, whatever handleIconDelete() queued via the
+// admin page while the board was running (see that function's comment for
+// why it can only queue, not delete immediately). Runs once per boot, right
+// after the card mounts and before preloadIcons() reads it -- the one
+// window where touching SD is safe at all. Requires loadConfig() (prefs)
+// to have already run, which setup() guarantees by calling it first.
+void processPendingDeletes() {
+  String pending = prefs.getString("pendingDel", "");
+  if (pending.length() == 0) return;
+
+  int start = 0;
+  while (start < (int)pending.length()) {
+    int comma = pending.indexOf(',', start);
+    String name = (comma < 0) ? pending.substring(start) : pending.substring(start, comma);
+    if (name.length()) {
+      String path = "/icons/" + name + ".bin";
+      if (SD_MMC.remove(path)) {
+        consoleLog.printf("Processed pending delete: %s\n", name.c_str());
+      } else {
+        consoleLog.printf("Pending delete failed (already gone?): %s\n", name.c_str());
+      }
+    }
+    if (comma < 0) break;
+    start = comma + 1;
+  }
+  prefs.putString("pendingDel", "");
+}
+
+// Merges whatever handleIconUpload() staged in FATFS's /pending directory
+// while the board was running into SD's /icons/ (overwriting an existing
+// file of the same name -- last upload wins), then clears /pending so it
+// never accumulates. Runs once per boot, same window as
+// processPendingDeletes() above and for the same reason: this is called
+// from setupSD(), so SD is confirmed mounted; FATFS itself has no DMA-unsafe
+// window (it's the same internal flash chip the firmware runs from) and was
+// already mounted earlier in setup() by setupFatFS().
+void movePendingUploads() {
+  File dir = FFat.open("/pending");
+  if (!dir || !dir.isDirectory()) return;
+
+  // Collect full paths (path(), not name() -- see below) up front rather
+  // than deleting while the directory handle from openNextFile() is still
+  // walking it: removing an entry mid-iteration can skip the next one or
+  // corrupt the FAT directory cursor. Heap-allocated, not a local array --
+  // MAX_ICONS (500) Strings would be ~16KB, too much for the default ~8KB
+  // loop-task stack. In practice /pending holds at most a handful of files
+  // (one interactive upload at a time), so MAX_ICONS is a generous ceiling,
+  // not an expected count.
+  String *paths = new String[MAX_ICONS];
+  int n = 0;
+
+  File f = dir.openNextFile();
+  while (f && n < MAX_ICONS) {
+    if (!f.isDirectory()) {
+      // File::name() (as of arduino-esp32 2.x/3.x) returns just the
+      // basename ("sq_logo.bin"), not the path -- path() is the one that
+      // gives the full "/pending/sq_logo.bin". Using name() here would
+      // silently resolve FFat.remove() against root instead of /pending,
+      // never actually deleting anything.
+      String fname = String(f.name());
+      paths[n++] = String(f.path());
+
+      File sdFile = SD_MMC.open("/icons/" + fname, FILE_WRITE);
+      if (sdFile) {
+        uint8_t buf[512];
+        size_t r;
+        while ((r = f.read(buf, sizeof(buf))) > 0) sdFile.write(buf, r);
+        sdFile.close();
+        consoleLog.printf("Moved uploaded icon to SD: %s\n", fname.c_str());
+      } else {
+        consoleLog.printf("Failed to write uploaded icon to SD: %s\n", fname.c_str());
+      }
+    }
+    f = dir.openNextFile();
+  }
+  dir.close();
+
+  for (int i = 0; i < n; i++) {
+    if (!FFat.remove(paths[i])) {
+      consoleLog.printf("Failed to clear staged upload: %s\n", paths[i].c_str());
+    }
+  }
+  delete[] paths;
+}
+
+// Mounts FATFS on the internal flash partition (see the 32MB partition
+// scheme in README "Arduino IDE setup"). Unlike SD_MMC, this has no
+// DMA-unsafe window at all -- it's the same flash chip the firmware itself
+// runs from -- so it's mounted early and can be written to anytime,
+// including while the display is live. `true` formats it automatically on
+// a mount failure, which is expected and harmless on first-ever boot (a
+// fresh partition has no filesystem on it yet).
+void setupFatFS() {
+  // On a virgin ffat partition (first boot after flashing the 32MB
+  // partition scheme, or after any full-chip erase), the mount fails once
+  // and FFat.begin(true) formats it -- ~22MB, which takes long enough that
+  // without this line the board looks hung rather than just busy.
+  consoleLog.println("Mounting FATFS (formatting if this is the first boot on this partition -- may take a while)...");
+  if (!FFat.begin(true)) {
+    consoleLog.println("FATFS mount failed");
+  } else {
+    consoleLog.println("FATFS mounted");
+  }
 }
 
 void setupSD() {
   if (!SD_MMC.setPins(BSP_SD_CLK, BSP_SD_CMD, BSP_SD_D0)) {
-    Serial.println("SD_MMC setPins failed");
+    consoleLog.println("SD_MMC setPins failed");
     return;
   }
   if (!SD_MMC.begin("/sdcard", true)) {
-    Serial.println("SD card mount failed (is it FAT32?)");
+    consoleLog.println("SD card mount failed (is it FAT32?)");
     return;
   }
   if (SD_MMC.cardType() == CARD_NONE) {
-    Serial.println("No SD card detected");
+    consoleLog.println("No SD card detected");
     return;
   }
+  processPendingDeletes();
+  movePendingUploads();
   preloadIcons();
 }
 
 void setupMatrix() {
   HUB75_I2S_CFG mxconfig(PANEL_RES_X, PANEL_RES_Y, PANEL_CHAIN);
-  // Confirmed working config for this board+panel -- see matrix64/02_http_display
-  // for how this was arrived at (gpio.e is the row-address line; without it,
-  // content straddling the row-32 boundary splits into two bands).
+  // Confirmed working config for this board+panel, arrived at via Waveshare's
+  // stock panel examples (gpio.e is the row-address line; without it, content
+  // straddling the row-32 boundary splits into two bands).
   mxconfig.gpio.e = 9;
   mxconfig.clkphase = false;
   mxconfig.driver = HUB75_I2S_CFG::FM6126A;
@@ -423,31 +613,137 @@ void setupMatrix() {
   dma_display = new MatrixPanel_I2S_DMA(mxconfig);
   dma_display->begin();
   dma_display->setRotation(DISPLAY_ROTATION);
-  dma_display->setBrightness8(60);
+  dma_display->setBrightness8(cfgBrightness);
   dma_display->clearScreen();
   textColor = 0xFFFF; // white, RGB565
 }
 
 void setupWiFi() {
   WiFi.mode(WIFI_STA);
+  WiFi.setHostname(cfgHostname.c_str()); // must be set before begin() to take effect
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.printf("Connecting to %s", WIFI_SSID);
+  consoleLog.printf("Connecting to %s", WIFI_SSID);
   while (WiFi.status() != WL_CONNECTED) {
     delay(300);
-    Serial.print(".");
+    consoleLog.print(".");
   }
-  Serial.printf("\nConnected. IP: %s\n", WiFi.localIP().toString().c_str());
+  consoleLog.printf("\nConnected. IP: %s\n", WiFi.localIP().toString().c_str());
 
   lineCity = "READY " + WiFi.localIP().toString();
   scrollXCity = PANEL_RES_X;
+}
+
+// Resolves the UTC offset for wherever the board's WAN IP currently
+// geolocates to -- no lat/lon needed, no API key, and it means moving the
+// board to a new city no longer means editing a #define and reflashing.
+// TLS validated against the same built-in CA bundle as the icon-sync
+// downloads (see useBuiltinCACertBundle() above), not setInsecure().
+// Returns false (leaving *offsetSec untouched) on any failure -- network
+// down, an API down/rate-limited, unexpected JSON shape -- so the caller
+// can fall back to TIMEZONE_OFFSET_SEC_FALLBACK.
+//
+// Two hops, both to timeapi.io (previously worldtimeapi.org/api/ip -- a
+// single hop, but a small hobby-run service with a documented history of
+// extended outages; confirmed down, TLS handshake hanging, while building
+// this):
+//   1. api.ipify.org -- this board's own public IP as a bare text body (no
+//      JSON, no key). timeapi.io's IP-lookup endpoint, unlike
+//      worldtimeapi.org's, doesn't auto-detect the caller's IP -- it needs
+//      one passed explicitly, hence this first hop.
+//   2. timeapi.io/api/timezone/ip?ipAddress=<that ip> -- currentUtcOffset
+//      already has any active DST shift folded in (distinct from
+//      standardUtcOffset, which doesn't), so this is one field, not two to
+//      sum, and configTime() below doesn't need Timezone.h's POSIX-TZ DST
+//      rule parsing.
+//
+// Note: this only runs once at boot, same as the rest of setupNTP() before
+// it. A board left running for months across a DST transition (most of the
+// world outside Singapore) won't pick that transition up until its next
+// reboot -- add a periodic re-call from loop() (e.g. once/day, same pattern
+// as syncIcons()'s lastIconSync) if that matters for your location.
+bool fetchTimezoneOffset(long *offsetSec) {
+  String publicIp;
+  {
+    WiFiClientSecure client;
+    client.useBuiltinCACertBundle();
+    HTTPClient http;
+    http.setTimeout(8000);
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    if (!http.begin(client, "https://api.ipify.org")) {
+      consoleLog.println("Timezone lookup: failed to start ipify request");
+      return false;
+    }
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+      consoleLog.printf("Timezone lookup: ipify HTTP %d\n", code);
+      http.end();
+      return false;
+    }
+    publicIp = http.getString();
+    http.end();
+    publicIp.trim();
+    if (publicIp.length() == 0) {
+      consoleLog.println("Timezone lookup: empty IP from ipify");
+      return false;
+    }
+  }
+
+  WiFiClientSecure client;
+  client.useBuiltinCACertBundle();
+  HTTPClient http;
+  http.setTimeout(8000);
+  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+  String url = "https://timeapi.io/api/timezone/ip?ipAddress=" + publicIp;
+  if (!http.begin(client, url)) {
+    consoleLog.println("Timezone lookup: failed to start timeapi.io request");
+    return false;
+  }
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    consoleLog.printf("Timezone lookup: timeapi.io HTTP %d\n", code);
+    http.end();
+    return false;
+  }
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, http.getStream());
+  http.end();
+  if (err) {
+    consoleLog.printf("Timezone lookup: bad JSON (%s)\n", err.c_str());
+    return false;
+  }
+
+  if (!doc["currentUtcOffset"]["seconds"].is<long>()) {
+    consoleLog.println("Timezone lookup: response missing currentUtcOffset.seconds");
+    return false;
+  }
+  *offsetSec = doc["currentUtcOffset"]["seconds"];
+  const char *tzName = doc["timeZone"] | "unknown";
+  consoleLog.printf("Timezone lookup: %s, UTC%+ld:%02ld\n", tzName, *offsetSec / 3600, labs(*offsetSec / 60) % 60);
+  return true;
 }
 
 // Called once at boot, after WiFi is up. NTP sync happens in the background;
 // the clock screen (drawClock) just shows "SYNCING..." until getLocalTime()
 // first succeeds, so we don't need to block setup() waiting for it.
 void setupNTP() {
-  configTime(TIMEZONE_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, "pool.ntp.org", "time.nist.gov");
-  Serial.println("NTP configured");
+  long offsetSec = TIMEZONE_OFFSET_SEC_FALLBACK;
+  if (cfgTzOverrideEnabled) {
+    // Manual override set via the admin page (POST /api/config) -- skip the
+    // IP-geolocation lookup entirely rather than have it silently win a race
+    // against a value the user explicitly chose.
+    offsetSec = cfgTzOverrideOffsetSec;
+    consoleLog.printf("Timezone: manual override, UTC%+ld:%02ld\n", offsetSec / 3600, labs(offsetSec / 60) % 60);
+  } else if (!fetchTimezoneOffset(&offsetSec)) {
+    consoleLog.printf("Timezone lookup failed -- falling back to UTC%+ld:%02ld\n",
+                   TIMEZONE_OFFSET_SEC_FALLBACK / 3600, (TIMEZONE_OFFSET_SEC_FALLBACK / 60) % 60);
+    offsetSec = TIMEZONE_OFFSET_SEC_FALLBACK;
+  }
+  // dst_offset is already folded into offsetSec above (or n/a on the
+  // fallback path), so daylightOffset is always 0 here.
+  configTime(offsetSec, 0, "pool.ntp.org", "time.nist.gov");
+  consoleLog.println("NTP configured");
 }
 
 void resetAllScrollPositions() {
@@ -475,6 +771,7 @@ void handleDisplay() {
 
   String flight = doc["flight"] | "";
   currentIcon = doc["icon"] | "";
+  currentIconBuf = findIcon(currentIcon);
   lineAirline = doc["airline"] | "";
   lineMake = doc["make"] | "";
   lineModelShort = doc["modelShort"] | "";
@@ -503,6 +800,7 @@ void handleDisplay() {
 
 void handleClear() {
   currentIcon = "";
+  currentIconBuf = nullptr;
   lineAirline = "";
   lineFlightAlt = "";
   lineMake = "";
@@ -516,20 +814,21 @@ void handleClear() {
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
-// Serves the exact same frame currently drawn into `canvas` as a BMP --
-// open http://<board-ip>/debug/screenshot.bmp in a browser to see exactly
-// what's on the panel, no photographing needed.
-void handleScreenshot() {
-  const int w = PANEL_RES_X, h = PANEL_RES_Y;
-  const int rowBytes = w * 3; // 24bpp, no padding needed since 64*3=192 is a multiple of 4
+// Encodes a w x h RGB565 buffer as a 24bpp BMP (caller free()s the result).
+// Shared by handleScreenshot() (the 64x64 canvas) and handleIconBmp() (a
+// single 24x24 icon) -- same format, two different sources. Returns nullptr
+// on a malloc failure or a row width that isn't a multiple of 4 bytes (BMP's
+// row-padding requirement; both current callers' widths -- 64 and 24 -- are
+// already multiples of 4 pixels so this never actually trips, but it's
+// checked rather than assumed).
+uint8_t *encodeBmp(const uint16_t *pixels, int w, int h, size_t *outSize) {
+  const int rowBytes = w * 3; // 24bpp
+  if (rowBytes % 4 != 0) return nullptr;
   const int pixelDataSize = rowBytes * h;
   const int fileSize = 54 + pixelDataSize;
 
   uint8_t *bmp = (uint8_t *)malloc(fileSize);
-  if (!bmp) {
-    server.send(500, "text/plain", "out of memory");
-    return;
-  }
+  if (!bmp) return nullptr;
 
   auto putLE16 = [](uint8_t *p, uint16_t v) { p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF; };
   auto putLE32 = [](uint8_t *p, uint32_t v) {
@@ -547,11 +846,10 @@ void handleScreenshot() {
   putLE16(bmp + 28, 24); // bits per pixel
   putLE32(bmp + 34, pixelDataSize);
 
-  uint16_t *src = canvas.getBuffer();
   uint8_t *px = bmp + 54;
   for (int y = h - 1; y >= 0; y--) { // BMP rows are stored bottom-up
     for (int x = 0; x < w; x++) {
-      uint16_t c = src[y * w + x];
+      uint16_t c = pixels[y * w + x];
       uint8_t r = ((c >> 11) & 0x1F) * 255 / 31;
       uint8_t g = ((c >> 5) & 0x3F) * 255 / 63;
       uint8_t b = (c & 0x1F) * 255 / 31;
@@ -559,6 +857,17 @@ void handleScreenshot() {
     }
   }
 
+  *outSize = fileSize;
+  return bmp;
+}
+
+void sendBmp(const uint16_t *pixels, int w, int h) {
+  size_t fileSize;
+  uint8_t *bmp = encodeBmp(pixels, w, h, &fileSize);
+  if (!bmp) {
+    server.send(500, "text/plain", "out of memory");
+    return;
+  }
   server.sendHeader("Content-Type", "image/bmp");
   server.setContentLength(fileSize);
   server.send(200);
@@ -566,7 +875,642 @@ void handleScreenshot() {
   free(bmp);
 }
 
+// Serves the exact same frame currently drawn into `canvas` as a BMP --
+// open http://<board-ip>/debug/screenshot.bmp in a browser to see exactly
+// what's on the panel, no photographing needed.
+void handleScreenshot() {
+  sendBmp(canvas.getBuffer(), PANEL_RES_X, PANEL_RES_Y);
+}
+
+// GET /api/icon.bmp?name=<icon name, no .bin> -- a single icon's pixels as a
+// BMP, for the admin page's icon browser grid (plain <img> tags, no
+// client-side RGB565 decoding needed).
+void handleIconBmp() {
+  if (!server.hasArg("name")) {
+    server.send(400, "text/plain", "missing name");
+    return;
+  }
+  uint16_t *px = findIcon(server.arg("name"));
+  if (!px) {
+    server.send(404, "text/plain", "not found");
+    return;
+  }
+  sendBmp(px, ICON_SIZE, ICON_SIZE);
+}
+
+// GET /api/icons -- JSON array of every icon name currently loaded (PSRAM,
+// i.e. what's actually available to show, not necessarily 1:1 with what's
+// on the SD card -- see handleIconDelete() below for why those can diverge).
+void handleIconList() {
+  JsonDocument doc;
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < iconCount; i++) arr.add(icons[i].name);
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+// POST /api/icons/delete?name=<icon name> -- removes an icon from PSRAM
+// immediately (so it stops being shown/served), but the matching SD file
+// under /icons/ can't be touched here: SD access is unreliable once the
+// HUB75 DMA display is running (see the header comment and setupSD() --
+// the same constraint that shapes syncIcons()). Instead the name is queued
+// in NVS (Preferences) and actually deleted from SD by
+// processPendingDeletes(), called from setupSD() on the *next* boot, before
+// preloadIcons() runs -- the next safe window to touch the card at all.
+void handleIconDelete() {
+  if (!server.hasArg("name")) {
+    server.send(400, "text/plain", "missing name");
+    return;
+  }
+  String name = server.arg("name");
+  int idx = findIconIndex(name);
+  if (idx < 0) {
+    server.send(404, "text/plain", "not found");
+    return;
+  }
+
+  free(icons[idx].pixels);
+  for (int i = idx; i < iconCount - 1; i++) icons[i] = icons[i + 1];
+  iconCount--;
+  // The old last slot (index iconCount, post-decrement) still holds a copy
+  // of icons[iconCount-1]'s pointer after the shift above -- both "own" it
+  // now. Left alone, the next icon added there (syncIcons()) would silently
+  // leak that duplicated buffer, and a second delete before that happens
+  // would free() it twice. Null it out so it's unambiguously not an owner.
+  icons[iconCount].pixels = nullptr;
+  icons[iconCount].name = "";
+  if (currentIcon == name) {
+    currentIcon = "";
+    currentIconBuf = nullptr;
+  }
+
+  String pending = prefs.getString("pendingDel", "");
+  // Plain indexOf() would false-positive on a substring match (queuing
+  // "q_logo" while "sq_logo" is already queued would look like a duplicate
+  // and get skipped) -- bracket both sides with the "," delimiter so only a
+  // full, delimited match counts.
+  String bracketed = "," + pending + ",";
+  // 1500-char cap -- comfortably under NVS's ~4000-byte string value limit,
+  // with room to spare even for many double-digit icon names queued across
+  // a long uptime without a reboot. If it's ever hit, the oldest queued
+  // names just don't get deleted from SD until this list is trimmed by a
+  // reboot running processPendingDeletes() -- not a crash, just deferred.
+  if (bracketed.indexOf("," + name + ",") < 0 && pending.length() < 1500) {
+    if (pending.length()) pending += ",";
+    pending += name;
+    prefs.putString("pendingDel", pending);
+  }
+
+  server.send(200, "application/json", "{\"ok\":true,\"note\":\"removed from memory now; SD deletion happens on next reboot\"}");
+}
+
+// State shared between handleIconUploadData() (called repeatedly as upload
+// chunks arrive) and handleIconUploadDone() (called once, after) -- the
+// WebServer upload API has no per-request context object, so this is the
+// standard pattern for it.
+File uploadFile;
+String uploadIconName;
+String uploadError;
+// Set true the moment UPLOAD_FILE_START actually fires. A POST to this
+// route with no (or malformed) multipart file field never triggers any
+// HTTPUpload callback at all, so without this flag handleIconUploadDone()
+// would report whatever uploadError was left over from a previous request
+// -- stale, and possibly a stale *success* read as success for a request
+// that sent nothing.
+bool uploadStarted = false;
+
+// POST /api/icons/upload (multipart/form-data, one file field) -- the data
+// half of the upload. Writes straight to FATFS's /pending/ (internal flash,
+// no DMA-unsafe window -- see setupFatFS()), validates the finished file is
+// exactly a 24x24 raw565 icon, and on success loads it into PSRAM
+// immediately so it's usable without a reboot. The SD card itself is
+// untouched here: movePendingUploads() (called from setupSD() on the next
+// boot) is what actually merges /pending into SD's /icons/, overwriting any
+// existing file of the same name.
+void handleIconUploadData() {
+  HTTPUpload &upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    uploadStarted = true;
+    uploadError = "";
+    String fname = upload.filename;
+    int slash = fname.lastIndexOf('/');
+    if (slash >= 0) fname = fname.substring(slash + 1);
+    fname.toLowerCase();
+    if (!fname.endsWith(".bin")) fname += ".bin";
+    uploadIconName = fname.substring(0, fname.length() - 4); // strip ".bin" for the icon key
+
+    if (uploadIconName.length() == 0) {
+      // A bare ".bin" (or no filename at all, which the browser's File API
+      // won't produce but a hand-crafted request could) would otherwise
+      // stage a file with an empty icon key -- reject it here rather than
+      // let it through and confuse findIconIndex("") later.
+      uploadError = "filename is empty (must be <name>.bin)";
+      return;
+    }
+
+    if (!FFat.exists("/pending")) FFat.mkdir("/pending");
+    uploadFile = FFat.open("/pending/" + fname, FILE_WRITE);
+    if (!uploadFile) uploadError = "failed to open staging file";
+
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (uploadFile) uploadFile.write(upload.buf, upload.currentSize);
+
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (!uploadFile) {
+      if (uploadError.length() == 0) uploadError = "upload aborted";
+      return;
+    }
+    size_t finalSize = uploadFile.size();
+    uploadFile.close();
+
+    const size_t expected = ICON_SIZE * ICON_SIZE * 2;
+    String path = "/pending/" + uploadIconName + ".bin";
+    if (finalSize != expected) {
+      FFat.remove(path); // garbage, not something to migrate to SD later
+      uploadError = "wrong size: got " + String(finalSize) + " bytes, expected " + String(expected) +
+                     " (must be a " + String(ICON_SIZE) + "x" + String(ICON_SIZE) + " raw565 .bin from tools/convert_tiles.py)";
+      return;
+    }
+
+    File f = FFat.open(path);
+    if (!f) {
+      uploadError = "failed to re-read staged file";
+      return;
+    }
+    uint16_t *buf = (uint16_t *)ps_malloc(expected);
+    if (!buf) {
+      f.close();
+      uploadError = "PSRAM allocation failed";
+      return;
+    }
+    f.read((uint8_t *)buf, expected);
+    f.close();
+
+    int idx = findIconIndex(uploadIconName);
+    if (idx >= 0) {
+      free(icons[idx].pixels);
+      icons[idx].pixels = buf;
+      mbedtls_sha256((const uint8_t *)buf, expected, icons[idx].hash, 0);
+      if (currentIcon == uploadIconName) currentIconBuf = buf; // showing right now -- swap it live
+    } else if (iconCount < MAX_ICONS) {
+      icons[iconCount].name = uploadIconName;
+      icons[iconCount].pixels = buf;
+      mbedtls_sha256((const uint8_t *)buf, expected, icons[iconCount].hash, 0);
+      iconCount++;
+    } else {
+      free(buf);
+      uploadError = "MAX_ICONS reached -- staged on flash for next reboot, not loaded live";
+    }
+
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (uploadFile) uploadFile.close();
+    uploadError = "upload aborted";
+  }
+}
+
+// The response half of the same route -- called once, after
+// handleIconUploadData() has processed every chunk.
+void handleIconUploadDone() {
+  if (!uploadStarted) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"no file received\"}");
+    return;
+  }
+  uploadStarted = false; // reset for the next request regardless of outcome
+  if (uploadError.length()) {
+    String err = uploadError;
+    uploadError = "";
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"" + err + "\"}");
+  } else {
+    server.send(200, "application/json", "{\"ok\":true,\"note\":\"live now; merged onto SD card on next reboot\"}");
+  }
+}
+
+// POST /api/ota (multipart/form-data, one file field: a compiled .bin from
+// Arduino IDE's Sketch > Export Compiled Binary, or `arduino-cli compile
+// --output-dir`) -- flashes it to the inactive ota_0/ota_1 app slot (see
+// README "Arduino IDE setup" for the 32MB partition scheme this needs) and
+// reboots into it on success. No authentication, same as every other
+// endpoint here -- anyone on the LAN can flash arbitrary firmware to this
+// board through this route. That's a materially bigger risk than the
+// no-auth convention elsewhere (a bad /api/display push shows a wrong
+// flight number; a bad /api/ota push replaces the firmware), accepted here
+// on the same LAN-only trust model the rest of this project already uses,
+// not because the risk is smaller.
+bool otaHasError = false;
+
+void handleOtaData() {
+  HTTPUpload &upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    otaHasError = false;
+    consoleLog.printf("OTA: starting update (%s)\n", upload.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      Update.printError(consoleLog);
+      otaHasError = true;
+    }
+
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!otaHasError && Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      Update.printError(consoleLog);
+      otaHasError = true;
+    }
+
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (!otaHasError) {
+      if (Update.end(true)) {
+        consoleLog.printf("OTA: wrote %u bytes, update complete\n", (unsigned)upload.totalSize);
+      } else {
+        Update.printError(consoleLog);
+        otaHasError = true;
+      }
+    }
+
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    Update.abort();
+    otaHasError = true;
+  }
+}
+
+void handleOtaDone() {
+  if (otaHasError) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"update failed, see /api/log\"}");
+    return;
+  }
+  server.send(200, "application/json", "{\"ok\":true,\"note\":\"flashed -- rebooting into new firmware\"}");
+  delay(500); // let the response actually flush before the restart
+  ESP.restart();
+}
+
+// GET /api/log -- the consoleLog ring buffer's contents (plain text, tail
+// end is most recent).
+void handleLog() {
+  server.send(200, "text/plain", consoleLog.getTail());
+}
+
+// GET /api/wifi/scan -- JSON array of nearby SSIDs. WiFi.scanNetworks()
+// blocks for ~1-2s, which will visibly stall the panel's scroll animation
+// for that long (loop() can't run while this handler is blocked) -- an
+// acceptable tradeoff for an admin action you trigger manually and
+// infrequently, not something to run on a timer.
+void handleWifiScan() {
+  int n = WiFi.scanNetworks();
+  JsonDocument doc;
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < n; i++) {
+    JsonObject net = arr.add<JsonObject>();
+    net["ssid"] = WiFi.SSID(i);
+    net["rssi"] = WiFi.RSSI(i);
+    net["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+  }
+  WiFi.scanDelete();
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+// GET /api/status -- JSON status snapshot, polled by the admin page's JS to
+// keep the numbers live without a full page reload.
+void handleStatus() {
+  JsonDocument doc;
+  doc["uptimeSec"] = millis() / 1000;
+  doc["freeHeapKB"] = ESP.getFreeHeap() / 1024;
+  doc["freePsramKB"] = ESP.getFreePsram() / 1024;
+  doc["wifiSsid"] = WiFi.SSID();
+  doc["rssi"] = WiFi.RSSI();
+  doc["ip"] = WiFi.localIP().toString();
+  doc["mac"] = WiFi.macAddress();
+  doc["iconCount"] = iconCount;
+  doc["brightness"] = cfgBrightness;
+  doc["hostname"] = cfgHostname;
+  doc["timezone"] = cfgTzOverrideEnabled ? "manual override" : "auto (IP-geolocation at boot)";
+  // Raw config values (as opposed to the display-formatted "timezone" field
+  // above) -- the admin page's JS uses these to pre-fill the config form on
+  // load, since handleAdmin() itself is now a static template with no
+  // per-request HTML building (see its comment).
+  doc["tzOverrideEnabled"] = cfgTzOverrideEnabled;
+  doc["tzOffsetSec"] = cfgTzOverrideEnabled ? cfgTzOverrideOffsetSec : TIMEZONE_OFFSET_SEC_FALLBACK;
+  doc["nowShowing"] = lineFlightAlt.length() ? lineFlightAlt : "(clock)";
+  doc["route"] = lineIata.length() ? lineIata : "";
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+// Parses a UTC offset string like "+8:00", "-5:30", "8", "+05:45" into
+// seconds. Returns false (leaving *outSec untouched) on anything that
+// doesn't look like an offset -- used by handleConfig() to validate the
+// admin page's manual timezone-override field before writing it to NVS.
+bool parseUtcOffset(const String &s, long *outSec) {
+  String t = s;
+  t.trim();
+  if (t.length() == 0) return false;
+
+  bool negative = false;
+  int i = 0;
+  if (t[0] == '+' || t[0] == '-') {
+    negative = (t[0] == '-');
+    i = 1;
+  }
+
+  int colon = t.indexOf(':', i);
+  String hourStr = colon >= 0 ? t.substring(i, colon) : t.substring(i);
+  String minStr = colon >= 0 ? t.substring(colon + 1) : "0";
+  if (hourStr.length() == 0) return false;
+  for (size_t k = 0; k < hourStr.length(); k++) if (!isdigit((unsigned char)hourStr[k])) return false;
+  for (size_t k = 0; k < minStr.length(); k++) if (!isdigit((unsigned char)minStr[k])) return false;
+
+  long hours = hourStr.toInt();
+  long mins = minStr.toInt();
+  if (hours > 14 || mins > 59) return false; // UTC-12 .. UTC+14 covers every real timezone
+
+  long total = hours * 3600 + mins * 60;
+  *outSec = negative ? -total : total;
+  return true;
+}
+
+// GET / -- server-rendered status + config admin page. Deliberately no JS:
+// this is a plain reload-to-refresh page, not a live dashboard -- the
+// existing /debug/screenshot.bmp already covers "what's on the panel right
+// now" for anyone who wants that.
+// GET / -- the admin dashboard. Unlike v1 (server-built HTML string per
+// request), this is one static template with no per-request string
+// concatenation: it fetches /api/status, /api/icons, /api/log as JSON on
+// load (and polls status + the live preview periodically) and hydrates the
+// DOM with JS. Cheaper on-device (no String churn on every GET /) and lets
+// the preview/status refresh live instead of only on a manual reload.
+// PROGMEM keeps this out of the 328KB RAM budget -- it's ~6KB of template
+// that only ever needs to live in flash until send() streams it out.
+const char ADMIN_PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html><head><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Mini Flightwall</title>
+<style>
+body{font-family:monospace;background:#111;color:#ddd;max-width:720px;margin:2em auto;padding:0 1em}
+h1{color:#6cf;font-size:1.3em;margin-bottom:.2em}
+.sub{color:#777;margin-bottom:1em}
+section{border:1px solid #333;border-radius:6px;padding:12px 16px;margin-bottom:1em}
+section>h2{margin:0 0 10px;color:#6cf;font-size:1em}
+table{width:100%;border-collapse:collapse}
+td{padding:2px 8px;border-bottom:1px solid #2a2a2a}
+td:first-child{color:#999;white-space:nowrap}
+input,button,select{font-family:inherit;background:#222;color:#ddd;border:1px solid #444;padding:4px 8px;margin:2px 0;border-radius:3px}
+button{cursor:pointer}
+button:hover{border-color:#6cf}
+fieldset{border:1px solid #333;border-radius:4px;margin-bottom:.5em}
+#preview{width:256px;height:256px;image-rendering:pixelated;border:1px solid #333;border-radius:4px;display:block;margin-bottom:8px}
+.icongrid{display:flex;flex-wrap:wrap;gap:8px}
+.icon{text-align:center;font-size:.7em;color:#999}
+.icon img{width:48px;height:48px;image-rendering:pixelated;border:1px solid #333;border-radius:3px;display:block}
+.icon button{font-size:.7em;padding:1px 4px;margin-top:2px}
+.wifinet{display:flex;justify-content:space-between;padding:2px 0;border-bottom:1px solid #2a2a2a}
+#log{background:#0a0a0a;color:#8f8;font-size:.75em;max-height:220px;overflow-y:auto;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all}
+.pill{display:inline-block;padding:0 6px;border-radius:8px;font-size:.75em;background:#1a3a1a;color:#8f8}
+</style></head><body>
+
+<h1 id='hostnameTitle'>Mini Flightwall</h1>
+<div class='sub'>Aircraft Overhead Display -- admin console</div>
+
+<section>
+<h2>Live preview</h2>
+<img id='preview' src='/debug/screenshot.bmp' alt='live panel preview'>
+<table id='statusTable'></table>
+</section>
+
+<section>
+<h2>Icons (<span id='iconCount'>-</span> loaded) <button onclick='loadIcons()'>Refresh</button></h2>
+<div class='icongrid' id='iconGrid'></div>
+<p>Upload a 24x24 raw565 <code>.bin</code> (from <code>tools/convert_tiles.py</code>) --
+shows on the panel immediately; merged onto the SD card on the next reboot.</p>
+<input type='file' id='iconFile' accept='.bin'>
+<button onclick='uploadIcon()'>Upload</button>
+<span id='uploadStatus'></span>
+</section>
+
+<section>
+<h2>WiFi</h2>
+<button onclick='scanWifi()'>Scan nearby networks</button>
+<div id='wifiResults'></div>
+</section>
+
+<section>
+<h2>Config</h2>
+<form method='POST' action='/api/config'>
+<table>
+<tr><td>Hostname</td><td><input name='hostname' id='cfgHostname'> <i>(reboot to apply)</i></td></tr>
+<tr><td>Brightness</td><td><input name='brightness' id='cfgBrightness' type='number' min='1' max='255'> <i>(1-255, live)</i></td></tr>
+<tr><td>TZ override</td><td><input name='tzOverrideEnabled' id='cfgTzEnabled' type='checkbox'> enabled
+  <input name='tzOffset' id='cfgTzOffset' placeholder='e.g. +8:00'></td></tr>
+</table>
+<button type='submit'>Save</button>
+</form>
+</section>
+
+<section>
+<h2>Log <span class='pill' id='logStatus'>live</span></h2>
+<pre id='log'>loading...</pre>
+</section>
+
+<section>
+<h2>Firmware update</h2>
+<p>Upload a compiled <code>.bin</code> (Arduino IDE: Sketch &gt; Export Compiled Binary).
+Flashes and reboots automatically -- no confirmation step once you click Flash, so
+double-check the file first. <b>No authentication on this endpoint</b> -- same
+LAN-only trust model as the rest of this board, but the stakes are higher here
+than a wrong flight number on the panel.</p>
+<input type='file' id='otaFile' accept='.bin'>
+<button onclick='uploadOta()'>Flash</button>
+<span id='otaStatus'></span>
+</section>
+
+<form method='POST' action='/api/reboot' onsubmit="return confirm('Reboot now?')">
+<button type='submit'>Reboot board</button>
+</form>
+
+<script>
+function fmtOffset(sec) {
+  const sign = sec < 0 ? '-' : '+';
+  const a = Math.abs(sec);
+  const h = Math.floor(a / 3600);
+  const m = Math.floor((a % 3600) / 60);
+  return sign + h + ':' + (m < 10 ? '0' : '') + m;
+}
+
+let formHydrated = false;
+
+function refreshStatus() {
+  fetch('/api/status').then(r => r.json()).then(s => {
+    document.getElementById('hostnameTitle').textContent = s.hostname;
+    document.title = s.hostname;
+    document.getElementById('iconCount').textContent = s.iconCount;
+    const rows = [
+      ['Uptime', s.uptimeSec + 's'],
+      ['Free heap', s.freeHeapKB + ' KB'],
+      ['Free PSRAM', s.freePsramKB + ' KB'],
+      ['WiFi', s.wifiSsid + ' (' + s.rssi + ' dBm)'],
+      ['IP', s.ip],
+      ['MAC', s.mac],
+      ['Timezone', s.timezone],
+      ['Brightness', s.brightness + ' / 255'],
+      ['Now showing', s.nowShowing],
+      ['Route', s.route || '-'],
+    ];
+    document.getElementById('statusTable').innerHTML =
+      rows.map(r => '<tr><td>' + r[0] + '</td><td>' + r[1] + '</td></tr>').join('');
+
+    // Only pre-fill the config form once -- otherwise a periodic refresh
+    // would stomp on whatever the user is mid-typing.
+    if (!formHydrated) {
+      formHydrated = true;
+      document.getElementById('cfgHostname').value = s.hostname;
+      document.getElementById('cfgBrightness').value = s.brightness;
+      document.getElementById('cfgTzEnabled').checked = s.tzOverrideEnabled;
+      document.getElementById('cfgTzOffset').value = fmtOffset(s.tzOffsetSec);
+    }
+  }).catch(() => {});
+}
+
+function loadIcons() {
+  fetch('/api/icons').then(r => r.json()).then(names => {
+    document.getElementById('iconGrid').innerHTML = names.map(n =>
+      "<div class='icon'><img src='/api/icon.bmp?name=" + n + "'><div>" + n + '</div>' +
+      "<button onclick=\"deleteIcon('" + n + "')\">delete</button></div>"
+    ).join('');
+  });
+}
+
+function deleteIcon(name) {
+  if (!confirm('Delete ' + name + '? (frees memory now; removed from the SD card on next reboot)')) return;
+  fetch('/api/icons/delete?name=' + encodeURIComponent(name), { method: 'POST' })
+    .then(() => loadIcons());
+}
+
+function uploadIcon() {
+  const input = document.getElementById('iconFile');
+  const status = document.getElementById('uploadStatus');
+  if (!input.files.length) { status.textContent = 'choose a file first'; return; }
+  const fd = new FormData();
+  fd.append('icon', input.files[0]);
+  status.textContent = 'uploading...';
+  fetch('/api/icons/upload', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(j => {
+      status.textContent = j.ok ? 'done' : ('error: ' + j.error);
+      if (j.ok) { input.value = ''; loadIcons(); }
+    })
+    .catch(() => { status.textContent = 'upload failed'; });
+}
+
+function uploadOta() {
+  const input = document.getElementById('otaFile');
+  const status = document.getElementById('otaStatus');
+  if (!input.files.length) { status.textContent = 'choose a file first'; return; }
+  if (!confirm('Flash ' + input.files[0].name + ' and reboot? This cannot be undone from here.')) return;
+  const fd = new FormData();
+  fd.append('firmware', input.files[0]);
+  status.textContent = 'flashing... (do not close this page or power off the board)';
+  fetch('/api/ota', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(j => {
+      status.textContent = j.ok ? 'flashed -- rebooting, this page will go dark briefly' : ('error: ' + j.error);
+    })
+    .catch(() => { status.textContent = 'board rebooting (connection dropped, which is expected)'; });
+}
+
+function scanWifi() {
+  const el = document.getElementById('wifiResults');
+  el.textContent = 'Scanning (~2s, panel scroll will pause)...';
+  fetch('/api/wifi/scan').then(r => r.json()).then(nets => {
+    nets.sort((a, b) => b.rssi - a.rssi);
+    el.innerHTML = nets.map(n =>
+      "<div class='wifinet'><span>" + (n.secure ? '🔒 ' : '') + n.ssid + '</span><span>' + n.rssi + ' dBm</span></div>'
+    ).join('') || '<i>none found</i>';
+  });
+}
+
+function refreshLog() {
+  fetch('/api/log').then(r => r.text()).then(t => {
+    const el = document.getElementById('log');
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 20;
+    el.textContent = t;
+    if (atBottom) el.scrollTop = el.scrollHeight;
+  }).catch(() => {});
+}
+
+refreshStatus();
+loadIcons();
+refreshLog();
+setInterval(refreshStatus, 3000);
+setInterval(refreshLog, 5000);
+setInterval(() => { document.getElementById('preview').src = '/debug/screenshot.bmp?t=' + Date.now(); }, 1000);
+</script>
+</body></html>)HTML";
+
+void handleAdmin() {
+  server.send_P(200, "text/html", ADMIN_PAGE);
+}
+
+// POST /api/config -- standard HTML form post (application/x-www-form-urlencoded),
+// not JSON, since it's submitted by the plain <form> in handleAdmin() above.
+// Persists to NVS via Preferences; brightness applies immediately, hostname
+// and a newly-enabled/changed TZ override need a reboot (WiFi.setHostname()
+// only takes effect before WiFi.begin(), and re-running configTime() live is
+// more moving parts than just asking for a reboot, same UX as hostname).
+void handleConfig() {
+  if (server.hasArg("hostname")) {
+    String h = server.arg("hostname");
+    h.trim();
+    if (h.length() > 0 && h.length() < 32) {
+      cfgHostname = h;
+      prefs.putString("hostname", cfgHostname);
+    }
+  }
+
+  if (server.hasArg("brightness")) {
+    int b = server.arg("brightness").toInt();
+    if (b >= 1 && b <= 255) {
+      cfgBrightness = (uint8_t)b;
+      prefs.putUChar("brightness", cfgBrightness);
+      if (dma_display) dma_display->setBrightness8(cfgBrightness); // applies live
+    }
+  }
+
+  bool tzEnabled = server.hasArg("tzOverrideEnabled"); // checkbox: present only if checked
+  long tzOffsetSec;
+  if (tzEnabled && server.hasArg("tzOffset") && parseUtcOffset(server.arg("tzOffset"), &tzOffsetSec)) {
+    cfgTzOverrideEnabled = true;
+    cfgTzOverrideOffsetSec = tzOffsetSec;
+    prefs.putBool("tzOverride", true);
+    prefs.putLong("tzOffsetSec", tzOffsetSec);
+  } else if (!tzEnabled) {
+    cfgTzOverrideEnabled = false;
+    prefs.putBool("tzOverride", false);
+  }
+  // else: checkbox was on but the offset text didn't parse -- leave the
+  // previous stored override alone rather than silently disabling it.
+
+  server.sendHeader("Location", "/");
+  server.send(303); // redirect back to the admin page showing the new values
+}
+
+void handleReboot() {
+  server.send(200, "text/plain", "Rebooting...");
+  delay(200); // let the response actually flush before the restart
+  ESP.restart();
+}
+
 void setupServer() {
+  server.on("/", HTTP_GET, handleAdmin);
+  server.on("/api/config", HTTP_POST, handleConfig);
+  server.on("/api/reboot", HTTP_POST, handleReboot);
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/log", HTTP_GET, handleLog);
+  server.on("/api/icons", HTTP_GET, handleIconList);
+  server.on("/api/icon.bmp", HTTP_GET, handleIconBmp);
+  server.on("/api/icons/delete", HTTP_POST, handleIconDelete);
+  server.on("/api/icons/upload", HTTP_POST, handleIconUploadDone, handleIconUploadData);
+  server.on("/api/ota", HTTP_POST, handleOtaDone, handleOtaData);
+  server.on("/api/wifi/scan", HTTP_GET, handleWifiScan);
   server.on("/api/display", HTTP_POST, handleDisplay);
   server.on("/api/clear", HTTP_POST, handleClear);
   server.on("/debug/screenshot.bmp", HTTP_GET, handleScreenshot);
@@ -574,7 +1518,12 @@ void setupServer() {
 }
 
 void setup() {
-  Serial.begin(115200);
+  consoleLog.begin(115200);
+  loadConfig();           // needed before setupWiFi() (hostname) and
+                           // setupMatrix() (brightness) below
+  setupFatFS();           // internal flash -- no DMA-unsafe window, but
+                           // movePendingUploads() below (called from
+                           // setupSD()) needs it mounted first
   setupSD();             // must finish before setupMatrix() -- SD access
                           // after the HUB75 DMA display starts is unreliable
                           // on this board.
@@ -636,9 +1585,8 @@ void drawAircraft() {
   drawScrollIfNeeded(lineAirline, AIRLINE_Y, 1, FULL_WIDTH_AVAIL, scrollXAirline);
   drawScrollIfNeeded(lineFlightAlt, FLIGHTALT_Y, 1, FULL_WIDTH_AVAIL, scrollXFlightAlt);
 
-  uint16_t *iconBuf = findIcon(currentIcon);
-  if (iconBuf) {
-    canvas.drawRGBBitmap(ICON_X, ICON_Y, iconBuf, ICON_SIZE, ICON_SIZE);
+  if (currentIconBuf) {
+    canvas.drawRGBBitmap(ICON_X, ICON_Y, currentIconBuf, ICON_SIZE, ICON_SIZE);
   }
   drawScrollClipped(lineMake, RIGHT_COL_X, MAKE_Y, RIGHT_COL_AVAIL, scrollXMake);
   drawScrollClipped(lineModelShort, RIGHT_COL_X, MODELSHORT_Y, RIGHT_COL_AVAIL, scrollXModelShort);
@@ -646,12 +1594,17 @@ void drawAircraft() {
   drawScrollIfNeeded(lineIata, IATA_Y, 1, FULL_WIDTH_AVAIL, scrollXIata);
 
   // City names always scroll -- full airport names routinely exceed 64px
-  // even alone, so there's no meaningful "fits statically" case here.
+  // even alone, so there's no meaningful "fits statically" case here. Drawn
+  // at 2x size (12px/char, not 6) -- fills the panel's bottom edge exactly
+  // and reads more clearly than the rest of the small (6x8) text, which
+  // fits the "final answer" nature of a destination name.
   if (lineCity.length()) {
+    canvas.setTextSize(2);
     canvas.setCursor(scrollXCity, CITY_Y);
     canvas.print(lineCity);
     scrollXCity--;
-    if (scrollXCity < -(int)(lineCity.length() * 6)) scrollXCity = PANEL_RES_X;
+    if (scrollXCity < -(int)(lineCity.length() * 12)) scrollXCity = PANEL_RES_X;
+    canvas.setTextSize(1); // restore for any subsequent draw call this frame
   }
 }
 
@@ -687,7 +1640,23 @@ void drawClock() {
   canvas.print(dateBuf);
 }
 
+unsigned long lastWiFiCheck = 0;
+
 void loop() {
+  // setupWiFi() only blocks-until-connected once at boot -- with no recovery
+  // path, a dropped connection (router reboot, brief outage) would otherwise
+  // leave the board silently unreachable until it's power-cycled by hand.
+  // WiFi.reconnect() is non-blocking (unlike WiFi.begin() looped with
+  // delay()), so this check costs nothing when already connected.
+  unsigned long nowWiFi = millis();
+  if (nowWiFi - lastWiFiCheck >= 5000) {
+    lastWiFiCheck = nowWiFi;
+    if (WiFi.status() != WL_CONNECTED) {
+      consoleLog.println("WiFi disconnected -- reconnecting...");
+      WiFi.reconnect();
+    }
+  }
+
   server.handleClient();
 
   // Cast to unsigned long makes this subtraction wrap correctly even across
@@ -697,6 +1666,11 @@ void loop() {
   if ((unsigned long)(millis() - lastIconSync) >= ICON_SYNC_INTERVAL_MS) {
     lastIconSync = millis();
     syncIcons(false);
+    // syncIcons() may free() and reallocate the pixel buffer for whichever
+    // icon is currently on screen (if its art changed upstream) -- re-resolve
+    // rather than risk drawAircraft() reading a freed pointer. Cheap: this
+    // whole branch only runs once per ICON_SYNC_INTERVAL_MS (3 days).
+    currentIconBuf = findIcon(currentIcon);
   }
 
   bool haveContent = lineAirline.length() || lineFlightAlt.length() || lineMake.length() ||
@@ -713,8 +1687,11 @@ void loop() {
     drawClock();
   }
 
-  // Flip to the back buffer, wait for the swap to take visual effect (see
-  // matrix64/02_http_display for why), then blit the freshly-drawn canvas.
+  // Flip to the back buffer, then wait one frame period for the swap to
+  // actually take visual effect before blitting the freshly-drawn canvas --
+  // flipDMABuffer() queues the swap for the next DMA scan pass rather than
+  // applying it synchronously, so drawing immediately after it would race
+  // the still-in-flight previous frame.
   dma_display->flipDMABuffer();
   delay(1000 / dma_display->calculated_refresh_rate);
   dma_display->drawRGBBitmap(0, 0, canvas.getBuffer(), PANEL_RES_X, PANEL_RES_Y);
