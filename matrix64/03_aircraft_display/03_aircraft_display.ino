@@ -65,16 +65,20 @@
 // line, which always scrolls (full airport names routinely exceed 64px
 // even alone, so there's no meaningful "fits" case for it).
 //
+// Five sections, each 6x8px/char size-1 text, separated by a 2px SECTION_GAP
+// (see the layout #defines) so the leftover space on a 64px panel is spent
+// as even breathing room instead of one dead gap or an oversized last row:
+//
 //  y  0- 7: airline name, full width, e.g. "Singapore Airlines"
-//  y  8-15: flight number + altitude, full width, e.g. "SQ123   35000ft"
-//  y 16-39: icon (24x24, left-aligned) with, to its right:
-//             y ~20: make (manufacturer), e.g. "Airbus"
-//             y ~30: modelShort (short ICAO type code), e.g. "A320"
+//  y 10-17: flight number + altitude, full width, e.g. "SQ123   35000ft"
+//  y 20-43: icon (24x24, left-aligned) with, to its right:
+//             y ~24: make (manufacturer), e.g. "Airbus"
+//             y ~34: modelShort (short ICAO type code), e.g. "A320"
 //           (airframe age would go here too, but no data source has it --
 //           adsbdb's /v0/aircraft/{icao24} has no build-date field)
-//  y 41-48: IATA route codes, full width, e.g. "SIN>KUL"
-//  y 48-64: origin -> destination city names, 2x text size (ALWAYS
-//           scrolling) -- fills to the panel's bottom edge exactly
+//  y 46-53: IATA route codes, full width, e.g. "SIN>KUL"
+//  y 56-63: origin -> destination city names (ALWAYS scrolling) -- ends
+//           exactly at the panel's bottom edge
 //
 // Libraries required (Arduino Library Manager):
 //   - "ESP32 HUB75 LED MATRIX PANEL DMA Display" by mrfaptastic
@@ -186,25 +190,23 @@ Logger consoleLog;
 // dropping entries as more airlines get added.
 #define MAX_ICONS 500
 
-// Layout constants (see header comment above for the row map)
+// Layout constants (see header comment above for the row map). All text is
+// size-1 (6x8px/char, 8px-tall rows) -- five sections (airline,
+// flight/alt, icon block, IATA, city) total 56px of actual content on a
+// 64px-tall panel, so the leftover 8px is spent as four 2px gaps between
+// sections instead of one dead lump at the bottom (the original layout) or
+// stretching the last row to fill it (tried, looked disproportionate next
+// to the rest of the 6x8 text -- reverted).
+#define SECTION_GAP 2
 #define AIRLINE_Y 0
-#define FLIGHTALT_Y 8
-#define ICON_Y 16
+#define FLIGHTALT_Y (AIRLINE_Y + 8 + SECTION_GAP)              // 10
+#define ICON_Y (FLIGHTALT_Y + 8 + SECTION_GAP)                 // 20
 #define ICON_X 0
 #define RIGHT_COL_X (ICON_SIZE + 2)
 #define MAKE_Y (ICON_Y + 4)
 #define MODELSHORT_Y (ICON_Y + 14)
-// IATA_Y was ICON_Y+ICON_SIZE+1 (41), an 8px row ending at 48, which used to
-// leave a 1px gap before the old CITY_Y=49. Now that CITY_Y is 48 (see
-// below), that 1px gap became a 1-row overlap instead -- pulled back to the
-// icon's bottom edge with no gap (40) to clear it, rather than nudging
-// CITY_Y down and re-opening the dead-space gap the drawAircraft() comment
-// below explains.
-#define IATA_Y (ICON_Y + ICON_SIZE)  // 40
-// City row is drawn at 2x text size (16px tall, not 8) -- see drawAircraft()
-// -- so it lands exactly at the panel's bottom edge (48+16=64) instead of
-// leaving a 7px dead gap below an 8px row at the old CITY_Y=49.
-#define CITY_Y 48
+#define IATA_Y (ICON_Y + ICON_SIZE + SECTION_GAP)              // 46
+#define CITY_Y (IATA_Y + 8 + SECTION_GAP)                      // 56 -- 56+8=64, exactly the panel's bottom edge
 
 #define FULL_WIDTH_AVAIL (PANEL_RES_X - 2)     // full-width rows, 1px margin each side
 #define RIGHT_COL_AVAIL (PANEL_RES_X - RIGHT_COL_X - 1) // beside-icon rows
@@ -1594,17 +1596,16 @@ void drawAircraft() {
   drawScrollIfNeeded(lineIata, IATA_Y, 1, FULL_WIDTH_AVAIL, scrollXIata);
 
   // City names always scroll -- full airport names routinely exceed 64px
-  // even alone, so there's no meaningful "fits statically" case here. Drawn
-  // at 2x size (12px/char, not 6) -- fills the panel's bottom edge exactly
-  // and reads more clearly than the rest of the small (6x8) text, which
-  // fits the "final answer" nature of a destination name.
+  // even alone, so there's no meaningful "fits statically" case here.
+  // Same 6x8 size-1 text as every other row (tried 2x here to fill the old
+  // layout's dead space at the bottom -- looked disproportionately large
+  // next to the rest of the display, reverted; see the SECTION_GAP layout
+  // above for how that space is used instead).
   if (lineCity.length()) {
-    canvas.setTextSize(2);
     canvas.setCursor(scrollXCity, CITY_Y);
     canvas.print(lineCity);
     scrollXCity--;
-    if (scrollXCity < -(int)(lineCity.length() * 12)) scrollXCity = PANEL_RES_X;
-    canvas.setTextSize(1); // restore for any subsequent draw call this frame
+    if (scrollXCity < -(int)(lineCity.length() * 6)) scrollXCity = PANEL_RES_X;
   }
 }
 
