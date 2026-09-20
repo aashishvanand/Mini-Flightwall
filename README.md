@@ -147,13 +147,29 @@ Object storage was chosen over Cloudflare Images because the `.bin` files are he
 
 ## n8n workflow setup
 
-1. Import `matrix64_aircraft_workflow.json` into n8n.
-2. Open the **Config (edit per location)** node and fill in:
+`matrix64_aircraft_workflow.json` here is a standalone template (OpenSky-only,
+single-device push) for anyone running just the matrix panel on its own.
+
+**This build's actual feeder doesn't run that file.** The matrix panel is one
+push target on a shared workflow that also drives two Ulanzi AWTRIX/TC002
+clocks — see the sibling `Ulanzi Feeder` repo's `n8n_aircraft_workflow.json`
+for the full picture (dual-source OpenSky + FlightRadar24 positioning, route
+verification, per-device payload builders). That workflow's **Config** node
+holds one shared `HOME_LAT`/`HOME_LON`/`RADIUS_DEG` and OpenSky credentials
+for all three devices, plus a `MATRIX_IP` for this panel; its **Compare
+Routes** node feeds a `Build Payload (Matrix64)` branch that reconstructs
+this repo's full payload shape (airline, altitude, city names, aircraft
+type) using this repo's `Lookup Aircraft (adsbdb)` node and 24×24 icon set,
+then `POST`s to `Push to Matrix` / `Clear Matrix` exactly as described below.
+
+If you *are* running the matrix standalone (no Ulanzi clocks), import
+`matrix64_aircraft_workflow.json` instead and fill in:
    - `HOME_LAT` / `HOME_LON` — your location's coordinates (placeholders are `0.0` — replace before running)
    - `RADIUS_DEG` — search radius in degrees (default `0.15` ≈ ~16km)
    - `MATRIX_IP` — your ESP32's LAN IP (placeholder `192.168.1.50`)
    - `OPENSKY_CLIENT_ID` / `OPENSKY_CLIENT_SECRET` — from your [OpenSky API client credentials](https://opensky-network.org/apidoc/rest.html#authentication)
-3. Activate the workflow. It polls every 30 seconds, finds the nearest airborne aircraft, looks up its route and aircraft type, and pushes a display payload to the matrix.
+
+Then activate it. It polls every 30 seconds, finds the nearest airborne aircraft, looks up its route and aircraft type, and pushes a display payload to the matrix.
 
 ### Payload shape
 

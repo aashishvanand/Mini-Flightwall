@@ -116,8 +116,8 @@ extern const uint8_t rootca_crt_bundle_start[] asm("_binary_x509_crt_bundle_star
 #define ICON_SYNC_INTERVAL_MS (3UL * 24 * 60 * 60 * 1000) // 3 days
 
 // Timezone offset from UTC in seconds (edit per location). Default here is
-// IST (UTC+5:30) to match the HOME_LAT/HOME_LON in matrix64_aircraft_workflow.json.
-#define TIMEZONE_OFFSET_SEC 19800
+// SGT (UTC+8) to match the HOME_LAT/HOME_LON in matrix64_aircraft_workflow.json.
+#define TIMEZONE_OFFSET_SEC 28800
 #define DAYLIGHT_OFFSET_SEC 0
 
 #define PANEL_RES_X 64

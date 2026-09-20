@@ -16,3 +16,5 @@ build/
 .wrangler
 
 tools/*.sh
+# Local secrets (n8n API key, OpenSky client credentials)
+.env
