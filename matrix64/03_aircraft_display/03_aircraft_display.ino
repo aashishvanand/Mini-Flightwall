@@ -43,15 +43,17 @@
 // over that same validated connection) before it's written anywhere or
 // shown on the panel; a mismatch is dropped, not displayed.
 //
-// Payload from matrix64_aircraft_workflow.json's Build Payload node:
+// Payload from the n8n workflow's Build Payload (Matrix64) node:
 //   {
 //     "flight": "SQ123", "airline": "Singapore Airlines",
-//     "altitudeFt": 35000,
+//     "altitudeFt": 35000, "speedKt": 480, "verticalRateFpm": -650,
 //     "originCode": "SIN", "destCode": "KUL",
 //     "originCity": "Singapore Changi Airport",
 //     "destCity": "Kuala Lumpur International Airport",
 //     "icon": "sq_logo", "make": "Airbus", "modelShort": "A388"
 //   }
+// speedKt/verticalRateFpm are optional -- null (or absent) on either just
+// omits that part of the flight/altitude line, doesn't break the display.
 //
 // Rendering: everything is drawn into an off-screen GFXcanvas16 (same
 // draw calls as the real panel -- setCursor/print/drawRGBBitmap all work
@@ -70,7 +72,9 @@
 // as even breathing room instead of one dead gap or an oversized last row:
 //
 //  y  0- 7: airline name, full width, e.g. "Singapore Airlines"
-//  y 10-17: flight number + altitude, full width, e.g. "SQ123   35000ft"
+//  y 10-17: flight number + altitude + climb/descend + speed, full width,
+//           e.g. "SQ123   35000ft^ 480kt" ("^"=climbing, "v"=descending,
+//           omitted within +-200ft/min of level)
 //  y 20-43: icon (24x24, left-aligned) with, to its right:
 //             y ~24: make (manufacturer), e.g. "Airbus"
 //             y ~34: modelShort (short ICAO type code), e.g. "A320"
@@ -782,11 +786,29 @@ void handleDisplay() {
   String originCity = doc["originCity"] | "";
   String destCity = doc["destCity"] | "";
   long altitudeFt = doc["altitudeFt"] | -1;
+  long speedKt = doc["speedKt"] | -1;
+  // A real vertical rate can legitimately be 0 (level flight), so unlike
+  // altitudeFt/speedKt above this can't use a "-1 means missing" sentinel --
+  // check the JSON type directly instead.
+  bool hasVerticalRate = doc["verticalRateFpm"].is<long>();
+  long verticalRateFpm = hasVerticalRate ? (long)doc["verticalRateFpm"] : 0;
 
   lineFlightAlt = flight;
   if (altitudeFt >= 0) {
     if (lineFlightAlt.length()) lineFlightAlt += "   ";
     lineFlightAlt += String(altitudeFt) + "ft";
+    // Climb/descend indicator, ASCII only (the default GFX font has no
+    // unicode glyphs): "^" climbing, "v" descending, omitted within a
+    // +-200ft/min band of level (cruise-noise threshold, not literally 0 --
+    // a level cruise still jitters a little).
+    if (hasVerticalRate) {
+      if (verticalRateFpm > 200) lineFlightAlt += "^";
+      else if (verticalRateFpm < -200) lineFlightAlt += "v";
+    }
+  }
+  if (speedKt >= 0) {
+    if (lineFlightAlt.length()) lineFlightAlt += " ";
+    lineFlightAlt += String(speedKt) + "kt";
   }
 
   lineIata = (originCode.length() && destCode.length()) ? (originCode + ">" + destCode) : "";
