@@ -206,7 +206,7 @@ normal operation, they exist for the page's own JS to call.
 |---|---|---|
 | `/` | GET | Admin dashboard -- live preview, status, icon browser, WiFi scan, config, log, reboot, firmware update |
 | `/api/status` | GET | JSON status snapshot (uptime, heap/PSRAM, WiFi, icon count, current config, what's showing) |
-| `/api/config` | POST | Update hostname / brightness / manual timezone override (form-encoded, persisted to NVS) |
+| `/api/config` | POST | Update hostname / brightness / timezone override / night mode (form-encoded, persisted to NVS). **Requires HTTP Basic Auth** |
 | `/api/reboot` | POST | Reboot the board |
 | `/api/log` | GET | Tail of the in-memory log ring buffer (plain text) |
 | `/api/icons` | GET | JSON array of every icon name currently loaded in PSRAM |
@@ -214,7 +214,7 @@ normal operation, they exist for the page's own JS to call.
 | `/api/icons/delete?name=<n>` | POST | Remove an icon from PSRAM now; actually deleted from the SD card on next reboot (SD can't be touched while the display's DMA is running -- see "Icons" above) |
 | `/api/icons/upload` | POST | Upload a 24x24 raw565 `.bin` (multipart/form-data) -- stages to internal flash (FATFS, no DMA-unsafe window), loads into PSRAM immediately, merged onto the SD card on next reboot. See "Icon upload via the admin console" below |
 | `/api/wifi/scan` | GET | JSON list of nearby SSIDs (blocks ~1-2s; the panel's scroll will visibly pause) |
-| `/api/ota` | POST | Flash a new firmware `.bin` (multipart/form-data) and reboot into it. **No authentication** -- see "OTA firmware updates" below before relying on this |
+| `/api/ota` | POST | Flash a new firmware `.bin` (multipart/form-data) and reboot into it. **Requires HTTP Basic Auth** -- see "OTA firmware updates" below |
 
 ## Admin web console
 
@@ -225,11 +225,12 @@ and delete loaded icons, upload new ones, scan for WiFi networks, watch the
 live log, edit hostname/brightness/timezone-override, reboot, and flash new
 firmware -- all documented in the API table above.
 
-Like every other endpoint on this board, the console has **no
+Like every other endpoint on this board, most of the console has **no
 authentication** -- it trusts the LAN the same way `/api/display` always
 has. That's an explicit, accepted tradeoff for a board that's meant to
-never be exposed to the WAN, not an oversight; see "OTA firmware updates"
-below for where that tradeoff carries more weight than usual.
+never be exposed to the WAN, not an oversight. The two exceptions --
+changing config and flashing firmware -- are gated behind HTTP Basic Auth;
+see "OTA firmware updates" below for why those two specifically.
 
 ### Icon upload via the admin console
 
@@ -259,12 +260,50 @@ The Firmware update section of `/` accepts a compiled `.bin` (Arduino IDE:
 practical -- see "Arduino IDE setup"), rebooting into it automatically on
 success.
 
-This is meaningfully riskier than every other unauthenticated endpoint on
-this board: a bad `/api/display` push shows a wrong flight number, but a
-bad `/api/ota` push replaces the firmware. It's accepted on the same
-LAN-only trust model the rest of this project already uses, not because the
-stakes are actually lower here -- they aren't. Don't expose this board's
-HTTP port beyond your LAN.
+Unlike every other endpoint on this board, `/api/ota` (and `/api/config`,
+which can change the hostname or force a timezone) require HTTP Basic Auth
+-- your browser will prompt once and cache the credentials for the origin.
+Set `ADMIN_USER`/`ADMIN_PASSWORD` in `secrets.h` (see `secrets.h.example`);
+left unset, both fall back to `admin`/`changeme`, which is fine for a
+private LAN but the firmware logs a warning at boot if you're still on it.
+Every other endpoint stays unauthenticated, same LAN-only trust model as
+always -- these two specifically were judged too risky to leave open (a bad
+`/api/display` push shows a wrong flight number; a bad `/api/ota` push
+replaces the firmware).
+
+**Automatic rollback:** if a flashed firmware image fails to reach the end
+of `setup()` three boots in a row -- crashing or hanging every time, before
+WiFi/matrix/NTP/the web server are all confirmed up -- the board reverts to
+whichever partition last booted successfully and reboots into that instead,
+recovering from a bad flash without needing physical USB access. This is a
+software-level reimplementation of the idea (a boot-attempt counter and a
+"last known good partition" label, both in NVS), not ESP-IDF's own
+bootloader app-rollback feature -- the precompiled Arduino bootloader
+doesn't have that enabled, and toggling it isn't exposed through the IDE.
+
+### Reliability
+
+A few things exist specifically to keep this board running unattended for
+months, not weeks:
+
+- **Watchdog**: if `loop()` ever stops running for 30s straight (a hung
+  blocking call, a wedged request), the board reboots itself automatically
+  instead of sitting frozen until someone notices.
+- **Stale-data fallback**: if n8n stops pushing entirely -- the workflow
+  deactivated, the n8n host down, a sustained network problem -- the panel
+  falls back to the clock after 5 minutes of silence instead of showing an
+  aircraft that flew off long ago with no indication anything's wrong. A
+  routine `/api/clear` (no aircraft currently in range) counts as contact
+  and doesn't trigger this -- only *nothing at all* arriving does. Visible
+  in the admin page as "Last display push."
+- **Boot diagnostics**: the reset reason (power-on, brownout, panic, task
+  watchdog, ...) is logged at the top of every boot, visible in `/api/log`
+  -- useful for diagnosing an unexpected reboot after the fact without
+  physical USB access.
+- **Night mode**: optional brightness schedule (Config section of `/`) --
+  dims to a lower brightness during a configured local-time window (default
+  23:00-06:00) instead of running at full brightness in a dark room all
+  night. Applies live; the window can wrap past midnight.
 
 ## License
 

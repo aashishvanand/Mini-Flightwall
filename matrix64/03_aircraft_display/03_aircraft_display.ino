@@ -107,7 +107,24 @@
 #include "FFat.h"
 #include <Update.h>
 #include <Preferences.h>
+#include <esp_task_wdt.h>
+#include "esp_system.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include "secrets.h"
+
+// Explicit forward declaration: Arduino's automatic function-prototype
+// generation (ctags-based) appears to stop working correctly for the rest
+// of the file once it hits setupWatchdog()'s designated-initializer struct
+// literal (esp_task_wdt_config_t wdtConfig = { .timeout_ms = ..., ... }) --
+// a known ctags limitation with that syntax, confirmed by this exact
+// symptom (a "not declared in this scope" error for a function that's
+// defined later in the file, the normal case auto-prototyping exists to
+// handle). applyBrightnessForTime() is called from handleConfig(), which
+// is defined earlier in the file than it is -- hence needing this. If a
+// similar error shows up for some other function added after this point,
+// the fix is the same: add its prototype here too.
+void applyBrightnessForTime();
 
 // Every Serial.print*() call in this file goes through consoleLog instead
 // (see the class below) -- same output over USB Serial, plus a ring buffer
@@ -161,6 +178,18 @@ Logger consoleLog;
 // here as a no-op default so builds without it configured still compile.
 #ifndef ICON_BASE_URL
 #define ICON_BASE_URL ""
+#endif
+
+// Gates POST /api/config and POST /api/ota -- see secrets.h.example for the
+// full rationale. Falls back to a well-known default rather than failing
+// to compile, same reasoning as ICON_BASE_URL above; a boot-time log line
+// (see setupServer()) calls out when the fallback is actually in use so it
+// doesn't go unnoticed on a network where that matters.
+#ifndef ADMIN_USER
+#define ADMIN_USER "admin"
+#endif
+#ifndef ADMIN_PASSWORD
+#define ADMIN_PASSWORD "changeme"
 #endif
 
 // How often loop() re-checks the manifest for new/updated icons while the
@@ -244,12 +273,19 @@ uint16_t textColor;
 // defaults on first boot, then read back from NVS on every boot after.
 Preferences prefs;
 String cfgHostname;          // WiFi.setHostname() -- takes effect on next boot
-uint8_t cfgBrightness;       // dma_display->setBrightness8() -- live immediately
+uint8_t cfgBrightness;       // dma_display->setBrightness8() -- live immediately (day/default value)
 bool cfgTzOverrideEnabled;   // true = skip fetchTimezoneOffset(), use cfgTzOverrideOffsetSec
 long cfgTzOverrideOffsetSec; // manual UTC offset in seconds, only used if the above is true
+bool cfgNightModeEnabled;    // true = dim to cfgNightBrightness between cfgNightStartHour/EndHour
+uint8_t cfgNightBrightness;  // brightness during the night window
+uint8_t cfgNightStartHour;   // 0-23, local time (per the resolved/overridden timezone)
+uint8_t cfgNightEndHour;     // 0-23 -- start > end means the window spans midnight (e.g. 23 -> 6)
 
 #define DEFAULT_HOSTNAME "miniflightwall"
 #define DEFAULT_BRIGHTNESS 60
+#define DEFAULT_NIGHT_BRIGHTNESS 10
+#define DEFAULT_NIGHT_START_HOUR 23
+#define DEFAULT_NIGHT_END_HOUR 6
 
 void loadConfig() {
   prefs.begin("mf", false); // false = read/write
@@ -257,6 +293,10 @@ void loadConfig() {
   cfgBrightness = prefs.getUChar("brightness", DEFAULT_BRIGHTNESS);
   cfgTzOverrideEnabled = prefs.getBool("tzOverride", false);
   cfgTzOverrideOffsetSec = prefs.getLong("tzOffsetSec", TIMEZONE_OFFSET_SEC_FALLBACK);
+  cfgNightModeEnabled = prefs.getBool("nightEnabled", false);
+  cfgNightBrightness = prefs.getUChar("nightBright", DEFAULT_NIGHT_BRIGHTNESS);
+  cfgNightStartHour = prefs.getUChar("nightStart", DEFAULT_NIGHT_START_HOUR);
+  cfgNightEndHour = prefs.getUChar("nightEnd", DEFAULT_NIGHT_END_HOUR);
 }
 
 String currentIcon = "";
@@ -286,6 +326,19 @@ int scrollXCity = PANEL_RES_X;
 
 unsigned long lastScroll = 0;
 unsigned long lastIconSync = 0; // set once at boot; see ICON_SYNC_INTERVAL_MS
+
+// Set on every /api/display push; checked in loop() (see STALE_TIMEOUT_MS)
+// so a dead n8n workflow, a downed host, or a network blip doesn't leave
+// the panel silently showing an aircraft that's long gone with no
+// indication anything's wrong. 0 means "no push received yet this boot" --
+// deliberately not stale-checked (there's nothing to time out from), the
+// idle clock screen just shows normally until the first real push.
+unsigned long lastDisplayPush = 0;
+#define STALE_TIMEOUT_MS (5UL * 60 * 1000) // 5 minutes -- comfortably longer
+                                            // than the workflow's 30s poll
+                                            // interval, short enough that a
+                                            // real outage doesn't sit
+                                            // unnoticed for long
 
 int findIconIndex(const String &name) {
   for (int i = 0; i < iconCount; i++) {
@@ -568,6 +621,125 @@ void movePendingUploads() {
   delete[] paths;
 }
 
+// ---- Boot diagnostics ----
+
+const char *resetReasonToString(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON: return "power-on";
+    case ESP_RST_EXT: return "external pin";
+    case ESP_RST_SW: return "software (ESP.restart())";
+    case ESP_RST_PANIC: return "panic/exception";
+    case ESP_RST_INT_WDT: return "interrupt watchdog";
+    case ESP_RST_TASK_WDT: return "task watchdog";
+    case ESP_RST_WDT: return "other watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep sleep wake";
+    case ESP_RST_BROWNOUT: return "brownout (low voltage)";
+    case ESP_RST_SDIO: return "SDIO";
+    default: return "unknown";
+  }
+}
+
+// Logged as early as possible, before anything else, so the *previous*
+// boot's fate (crash, watchdog reset, brownout, normal restart, ...) is
+// visible in /api/log even without physical USB access -- useful now that
+// there's a remote log viewer at all.
+void logResetReason() {
+  consoleLog.printf("Boot: reset reason = %s\n", resetReasonToString(esp_reset_reason()));
+}
+
+// ---- OTA rollback safety ----
+
+#define OTA_BOOT_ATTEMPTS_KEY "otaBootTries"
+#define OTA_GOOD_PARTITION_KEY "otaGoodPart"
+#define OTA_MAX_BOOT_ATTEMPTS 3
+
+// Called as early as possible in setup() (right after loadConfig() opens
+// Preferences), before anything that could hang or crash. Arduino/
+// arduino-esp32's precompiled bootloader doesn't have ESP-IDF's own
+// app-rollback feature enabled -- that's a bootloader/sdkconfig setting
+// this build can't toggle from a sketch -- so this reimplements the same
+// idea at the application level instead: every boot is assumed failed
+// until confirmOtaBootSuccess() (called once setup() has gotten far enough
+// to be confident this firmware actually works) says otherwise. If a
+// firmware image fails to reach that point OTA_MAX_BOOT_ATTEMPTS times in
+// a row -- crashing or hanging before then, every time -- this manually
+// points the bootloader at whichever partition last booted successfully
+// and reboots into it, recovering from a bad OTA flash with no physical
+// access needed.
+void checkOtaRollback() {
+  int attempts = prefs.getInt(OTA_BOOT_ATTEMPTS_KEY, 0);
+  if (attempts >= OTA_MAX_BOOT_ATTEMPTS) {
+    String goodLabel = prefs.getString(OTA_GOOD_PARTITION_KEY, "");
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (goodLabel.length() && running && goodLabel != String(running->label)) {
+      const esp_partition_t *target = esp_partition_find_first(
+        ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, goodLabel.c_str());
+      if (target) {
+        consoleLog.printf("OTA rollback: %d failed boots on %s, reverting to %s\n",
+                           attempts, running->label, goodLabel.c_str());
+        esp_ota_set_boot_partition(target);
+        prefs.putInt(OTA_BOOT_ATTEMPTS_KEY, 0);
+        delay(500);
+        ESP.restart();
+      }
+    }
+  }
+  prefs.putInt(OTA_BOOT_ATTEMPTS_KEY, attempts + 1); // assumed-failed until confirmed otherwise
+}
+
+// Called once setup() has reached a point that's a reasonable "this
+// firmware actually works" signal (matrix initialized, NTP/server set up --
+// see the end of setup()) -- resets the failed-boot counter and records
+// the current partition as the rollback target for any future bad flash.
+// Also called on every ordinary (non-OTA) successful boot, which is
+// correct: it just means "otaGoodPart" always reflects whatever partition
+// last booted successfully, which is exactly the rollback target wanted.
+void confirmOtaBootSuccess() {
+  prefs.putInt(OTA_BOOT_ATTEMPTS_KEY, 0);
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  if (running) prefs.putString(OTA_GOOD_PARTITION_KEY, running->label);
+}
+
+// ---- Watchdog ----
+
+#define WDT_TIMEOUT_SEC 30
+
+// If loop() ever stops running for WDT_TIMEOUT_SEC straight -- a hung
+// blocking call, a wedged HTTP request, anything -- this reboots the board
+// automatically instead of it sitting frozen until someone notices and
+// power-cycles it by hand. Fed once per loop() iteration (see loop()
+// below); esp_task_wdt_config_t is the current arduino-esp32 3.x API
+// (older two-argument esp_task_wdt_init(timeout, panic) was removed).
+//
+// Deliberately called at the *end* of setup() (see setup() below), not the
+// start: setup() itself blocks for a while -- WiFi connect, icon sync/NTP
+// HTTPS round-trips, a first-boot FATFS format -- and nothing feeds the
+// watchdog until loop() starts. Watching from the top of setup() would
+// treat that normal startup time as a hang, tripping a false reset (and,
+// combined with checkOtaRollback()'s failed-boot counter, a false OTA
+// rollback on nothing worse than a slow WiFi connect).
+void setupWatchdog() {
+  esp_task_wdt_config_t wdtConfig = {
+    .timeout_ms = WDT_TIMEOUT_SEC * 1000,
+    .idle_core_mask = 0,
+    .trigger_panic = true
+  };
+  esp_err_t err = esp_task_wdt_init(&wdtConfig);
+  if (err == ESP_ERR_INVALID_STATE) {
+    // The core already initialized the task WDT itself (CONFIG_ESP_TASK_WDT_INIT)
+    // before this ever ran -- esp_task_wdt_init() refuses to re-init an
+    // already-running watchdog, which would otherwise silently leave
+    // whatever timeout the core defaulted to (5s is a common default,
+    // shorter than WDT_TIMEOUT_SEC) instead of the one configured here.
+    // Reconfigure the existing instance instead.
+    err = esp_task_wdt_reconfigure(&wdtConfig);
+  }
+  if (err != ESP_OK) {
+    consoleLog.printf("Watchdog init/reconfigure failed (esp_err_t %d) -- no auto-recovery from a hang this boot\n", err);
+  }
+  esp_task_wdt_add(NULL); // watch the current (Arduino loop) task
+}
+
 // Mounts FATFS on the internal flash partition (see the 32MB partition
 // scheme in README "Arduino IDE setup"). Unlike SD_MMC, this has no
 // DMA-unsafe window at all -- it's the same flash chip the firmware itself
@@ -629,14 +801,26 @@ void setupWiFi() {
   WiFi.setHostname(cfgHostname.c_str()); // must be set before begin() to take effect
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   consoleLog.printf("Connecting to %s", WIFI_SSID);
-  while (WiFi.status() != WL_CONNECTED) {
+  // Bounded, not infinite: setupWatchdog() runs before this (see setup()),
+  // and an AP that's simply down would otherwise spin here forever with
+  // nothing feeding the watchdog -- exactly the kind of hang it exists to
+  // catch. 30s (matches WDT_TIMEOUT_SEC) gives WiFi a real chance to
+  // connect while still guaranteeing this function returns either way;
+  // the periodic reconnect check in loop() keeps trying afterward if
+  // this attempt timed out.
+  unsigned long wifiDeadline = millis() + 30000;
+  while (WiFi.status() != WL_CONNECTED && millis() < wifiDeadline) {
     delay(300);
     consoleLog.print(".");
   }
-  consoleLog.printf("\nConnected. IP: %s\n", WiFi.localIP().toString().c_str());
 
-  lineCity = "READY " + WiFi.localIP().toString();
-  scrollXCity = PANEL_RES_X;
+  if (WiFi.status() == WL_CONNECTED) {
+    consoleLog.printf("\nConnected. IP: %s\n", WiFi.localIP().toString().c_str());
+    lineCity = "READY " + WiFi.localIP().toString();
+    scrollXCity = PANEL_RES_X;
+  } else {
+    consoleLog.println("\nWiFi connect timed out after 30s -- continuing boot, loop() will keep retrying");
+  }
 }
 
 // Resolves the UTC offset for wherever the board's WAN IP currently
@@ -818,11 +1002,16 @@ void handleDisplay() {
     lineFlightAlt = flight; // fallback if the payload was nearly empty
   }
 
+  lastDisplayPush = millis(); // see STALE_TIMEOUT_MS in loop()
   resetAllScrollPositions();
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
-void handleClear() {
+// Resets aircraft-display state back to "nothing to show" (falls back to
+// the clock). Shared by handleClear() (explicit POST /api/clear) and the
+// staleness check in loop() (no push received in STALE_TIMEOUT_MS) -- same
+// end state, two different triggers.
+void clearAircraftState() {
   currentIcon = "";
   currentIconBuf = nullptr;
   lineAirline = "";
@@ -831,6 +1020,18 @@ void handleClear() {
   lineModelShort = "";
   lineIata = "";
   lineCity = "";
+}
+
+void handleClear() {
+  // A clear is proof n8n is alive and reachable, same as a real /api/display
+  // push -- the field's actual meaning is "last contact with the workflow,"
+  // not "last aircraft shown." Without this, a routine quiet period (no
+  // aircraft in range -> n8n calls /api/clear, not /api/display) would
+  // falsely trip the staleness check in loop() after STALE_TIMEOUT_MS even
+  // though the pipeline is working exactly as intended, and then
+  // handleStatus() would misreport "none yet this boot" on a healthy board.
+  lastDisplayPush = millis();
+  clearAircraftState();
   canvas.fillScreen(0);
   dma_display->flipDMABuffer();
   delay(1000 / dma_display->calculated_refresh_rate);
@@ -1115,20 +1316,32 @@ void handleIconUploadDone() {
 // Arduino IDE's Sketch > Export Compiled Binary, or `arduino-cli compile
 // --output-dir`) -- flashes it to the inactive ota_0/ota_1 app slot (see
 // README "Arduino IDE setup" for the 32MB partition scheme this needs) and
-// reboots into it on success. No authentication, same as every other
-// endpoint here -- anyone on the LAN can flash arbitrary firmware to this
-// board through this route. That's a materially bigger risk than the
-// no-auth convention elsewhere (a bad /api/display push shows a wrong
-// flight number; a bad /api/ota push replaces the firmware), accepted here
-// on the same LAN-only trust model the rest of this project already uses,
-// not because the risk is smaller.
+// reboots into it on success. Gated by requireAuth() (see above) -- the
+// one endpoint on this board where "anyone on the LAN can hit it" was
+// judged too risky even under this project's usual no-auth convention (a
+// bad /api/display push shows a wrong flight number; a bad /api/ota push
+// replaces the firmware).
 bool otaHasError = false;
+// Auth is checked in UPLOAD_FILE_START below (headers, including
+// Authorization, always arrive before the multipart body), but the actual
+// 401 response has to be sent from handleOtaDone() instead of from here --
+// calling server.send()/requestAuthentication() mid-multipart-parse (while
+// this upload callback is still being invoked) isn't a state the WebServer
+// library's request lifecycle supports safely. So this just remembers the
+// verdict and lets the (harmlessly discarded) body finish streaming through.
+bool otaUnauthorized = false;
 
 void handleOtaData() {
   HTTPUpload &upload = server.upload();
 
   if (upload.status == UPLOAD_FILE_START) {
     otaHasError = false;
+    otaUnauthorized = !server.authenticate(ADMIN_USER, ADMIN_PASSWORD);
+    if (otaUnauthorized) {
+      otaHasError = true; // also short-circuits the WRITE/END branches below
+      consoleLog.println("OTA: rejected (bad or missing credentials)");
+      return;
+    }
     consoleLog.printf("OTA: starting update (%s)\n", upload.filename.c_str());
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
       Update.printError(consoleLog);
@@ -1158,6 +1371,10 @@ void handleOtaData() {
 }
 
 void handleOtaDone() {
+  if (otaUnauthorized) {
+    server.requestAuthentication();
+    return;
+  }
   if (otaHasError) {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"update failed, see /api/log\"}");
     return;
@@ -1199,6 +1416,7 @@ void handleWifiScan() {
 void handleStatus() {
   JsonDocument doc;
   doc["uptimeSec"] = millis() / 1000;
+  doc["secondsSinceLastPush"] = lastDisplayPush == 0 ? -1 : (long)((millis() - lastDisplayPush) / 1000);
   doc["freeHeapKB"] = ESP.getFreeHeap() / 1024;
   doc["freePsramKB"] = ESP.getFreePsram() / 1024;
   doc["wifiSsid"] = WiFi.SSID();
@@ -1215,6 +1433,10 @@ void handleStatus() {
   // per-request HTML building (see its comment).
   doc["tzOverrideEnabled"] = cfgTzOverrideEnabled;
   doc["tzOffsetSec"] = cfgTzOverrideEnabled ? cfgTzOverrideOffsetSec : TIMEZONE_OFFSET_SEC_FALLBACK;
+  doc["nightModeEnabled"] = cfgNightModeEnabled;
+  doc["nightBrightness"] = cfgNightBrightness;
+  doc["nightStartHour"] = cfgNightStartHour;
+  doc["nightEndHour"] = cfgNightEndHour;
   doc["nowShowing"] = lineFlightAlt.length() ? lineFlightAlt : "(clock)";
   doc["route"] = lineIata.length() ? lineIata : "";
   String out;
@@ -1325,6 +1547,10 @@ shows on the panel immediately; merged onto the SD card on the next reboot.</p>
 <tr><td>Brightness</td><td><input name='brightness' id='cfgBrightness' type='number' min='1' max='255'> <i>(1-255, live)</i></td></tr>
 <tr><td>TZ override</td><td><input name='tzOverrideEnabled' id='cfgTzEnabled' type='checkbox'> enabled
   <input name='tzOffset' id='cfgTzOffset' placeholder='e.g. +8:00'></td></tr>
+<tr><td>Night mode</td><td><input name='nightModeEnabled' id='cfgNightEnabled' type='checkbox'> enabled,
+  dim to <input name='nightBrightness' id='cfgNightBrightness' type='number' min='1' max='255' style='width:4em'>
+  from <input name='nightStart' id='cfgNightStart' type='number' min='0' max='23' style='width:3em'>:00
+  to <input name='nightEnd' id='cfgNightEnd' type='number' min='0' max='23' style='width:3em'>:00 (local time)</td></tr>
 </table>
 <button type='submit'>Save</button>
 </form>
@@ -1339,9 +1565,11 @@ shows on the panel immediately; merged onto the SD card on the next reboot.</p>
 <h2>Firmware update</h2>
 <p>Upload a compiled <code>.bin</code> (Arduino IDE: Sketch &gt; Export Compiled Binary).
 Flashes and reboots automatically -- no confirmation step once you click Flash, so
-double-check the file first. <b>No authentication on this endpoint</b> -- same
-LAN-only trust model as the rest of this board, but the stakes are higher here
-than a wrong flight number on the panel.</p>
+double-check the file first. <b>Requires the admin credentials</b> (your browser will
+prompt) -- the one endpoint on this board gated beyond the usual LAN-only trust model,
+because the stakes here are higher than a wrong flight number on the panel. If the
+firmware fails to boot properly 3 times in a row, it automatically reverts to the
+previous working version.</p>
 <input type='file' id='otaFile' accept='.bin'>
 <button onclick='uploadOta()'>Flash</button>
 <span id='otaStatus'></span>
@@ -1367,8 +1595,11 @@ function refreshStatus() {
     document.getElementById('hostnameTitle').textContent = s.hostname;
     document.title = s.hostname;
     document.getElementById('iconCount').textContent = s.iconCount;
+    const lastPush = s.secondsSinceLastPush < 0 ? 'none yet this boot'
+      : s.secondsSinceLastPush + 's ago' + (s.secondsSinceLastPush >= 300 ? ' -- STALE, fell back to clock' : '');
     const rows = [
       ['Uptime', s.uptimeSec + 's'],
+      ['Last display push', lastPush],
       ['Free heap', s.freeHeapKB + ' KB'],
       ['Free PSRAM', s.freePsramKB + ' KB'],
       ['WiFi', s.wifiSsid + ' (' + s.rssi + ' dBm)'],
@@ -1390,6 +1621,10 @@ function refreshStatus() {
       document.getElementById('cfgBrightness').value = s.brightness;
       document.getElementById('cfgTzEnabled').checked = s.tzOverrideEnabled;
       document.getElementById('cfgTzOffset').value = fmtOffset(s.tzOffsetSec);
+      document.getElementById('cfgNightEnabled').checked = s.nightModeEnabled;
+      document.getElementById('cfgNightBrightness').value = s.nightBrightness;
+      document.getElementById('cfgNightStart').value = s.nightStartHour;
+      document.getElementById('cfgNightEnd').value = s.nightEndHour;
     }
   }).catch(() => {});
 }
@@ -1474,13 +1709,35 @@ void handleAdmin() {
   server.send_P(200, "text/html", ADMIN_PAGE);
 }
 
+// Gates POST /api/config and (via the two-phase check in handleOtaData(),
+// since it's an upload) POST /api/ota. Every other endpoint on this board
+// stays unauthenticated -- see secrets.h.example and the README for why
+// specifically these two. server.requestAuthentication() sends a real 401
+// with WWW-Authenticate: Basic, which makes the browser show its native
+// credential prompt (this works for a fetch()-initiated request too, not
+// just a page navigation) and then cache the credentials for the origin,
+// not just this one handler's response.
+bool requireAuth() {
+  if (!server.authenticate(ADMIN_USER, ADMIN_PASSWORD)) {
+    server.requestAuthentication();
+    return false;
+  }
+  return true;
+}
+
 // POST /api/config -- standard HTML form post (application/x-www-form-urlencoded),
 // not JSON, since it's submitted by the plain <form> in handleAdmin() above.
-// Persists to NVS via Preferences; brightness applies immediately, hostname
-// and a newly-enabled/changed TZ override need a reboot (WiFi.setHostname()
-// only takes effect before WiFi.begin(), and re-running configTime() live is
-// more moving parts than just asking for a reboot, same UX as hostname).
+// Persists to NVS via Preferences; brightness and night-mode settings apply
+// immediately (via applyBrightnessForTime() at the end, not a direct
+// setBrightness8() call here -- see that function's comment for why: a
+// direct call would ignore whether it's currently inside the night window),
+// hostname and a newly-enabled/changed TZ override need a reboot
+// (WiFi.setHostname() only takes effect before WiFi.begin(), and
+// re-running configTime() live is more moving parts than just asking for a
+// reboot, same UX as hostname).
 void handleConfig() {
+  if (!requireAuth()) return;
+
   if (server.hasArg("hostname")) {
     String h = server.arg("hostname");
     h.trim();
@@ -1495,7 +1752,6 @@ void handleConfig() {
     if (b >= 1 && b <= 255) {
       cfgBrightness = (uint8_t)b;
       prefs.putUChar("brightness", cfgBrightness);
-      if (dma_display) dma_display->setBrightness8(cfgBrightness); // applies live
     }
   }
 
@@ -1513,6 +1769,32 @@ void handleConfig() {
   // else: checkbox was on but the offset text didn't parse -- leave the
   // previous stored override alone rather than silently disabling it.
 
+  cfgNightModeEnabled = server.hasArg("nightModeEnabled"); // checkbox
+  prefs.putBool("nightEnabled", cfgNightModeEnabled);
+
+  if (server.hasArg("nightBrightness")) {
+    int nb = server.arg("nightBrightness").toInt();
+    if (nb >= 1 && nb <= 255) {
+      cfgNightBrightness = (uint8_t)nb;
+      prefs.putUChar("nightBright", cfgNightBrightness);
+    }
+  }
+  if (server.hasArg("nightStart")) {
+    int h = server.arg("nightStart").toInt();
+    if (h >= 0 && h <= 23) {
+      cfgNightStartHour = (uint8_t)h;
+      prefs.putUChar("nightStart", cfgNightStartHour);
+    }
+  }
+  if (server.hasArg("nightEnd")) {
+    int h = server.arg("nightEnd").toInt();
+    if (h >= 0 && h <= 23) {
+      cfgNightEndHour = (uint8_t)h;
+      prefs.putUChar("nightEnd", cfgNightEndHour);
+    }
+  }
+  applyBrightnessForTime(); // pick up any brightness/night-mode change immediately, night-window-aware
+
   server.sendHeader("Location", "/");
   server.send(303); // redirect back to the admin page showing the new values
 }
@@ -1524,6 +1806,11 @@ void handleReboot() {
 }
 
 void setupServer() {
+  if (strcmp(ADMIN_PASSWORD, "changeme") == 0) {
+    consoleLog.println("WARNING: /api/config and /api/ota are using the default admin/changeme "
+                        "credentials -- set ADMIN_USER/ADMIN_PASSWORD in secrets.h if that's not "
+                        "acceptable for your network.");
+  }
   server.on("/", HTTP_GET, handleAdmin);
   server.on("/api/config", HTTP_POST, handleConfig);
   server.on("/api/reboot", HTTP_POST, handleReboot);
@@ -1543,8 +1830,13 @@ void setupServer() {
 
 void setup() {
   consoleLog.begin(115200);
-  loadConfig();           // needed before setupWiFi() (hostname) and
-                           // setupMatrix() (brightness) below
+  logResetReason();
+  loadConfig();           // opens Preferences -- needed before
+                           // checkOtaRollback() right below, and before
+                           // setupWiFi() (hostname) / setupMatrix()
+                           // (brightness) further down
+  checkOtaRollback();     // as early as possible, before anything that
+                          // could hang or crash
   setupFatFS();           // internal flash -- no DMA-unsafe window, but
                            // movePendingUploads() below (called from
                            // setupSD()) needs it mounted first
@@ -1559,6 +1851,12 @@ void setup() {
   setupMatrix();
   setupNTP();
   setupServer();
+  setupWatchdog();          // deliberately last -- see that function's comment
+                             // for why (everything above here can legitimately
+                             // block for a while and shouldn't trip it)
+  confirmOtaBootSuccess(); // reached the end of setup() without hanging or
+                            // crashing -- this firmware is good; reset the
+                            // rollback counter and record this partition
 }
 
 // Draws `text` statically at `staticX` if it fits within `availWidth`;
@@ -1631,6 +1929,42 @@ void drawAircraft() {
   }
 }
 
+// Night-mode brightness scheduling, checked periodically from loop() (see
+// lastBrightnessCheck). 0 is never a real brightness (the config form's
+// minimum is 1), so it doubles as an "not applied yet" sentinel -- avoids
+// calling setBrightness8() every check when nothing's actually changed.
+uint8_t lastAppliedBrightness = 0;
+
+void applyBrightnessForTime() {
+  if (!cfgNightModeEnabled) {
+    if (lastAppliedBrightness != cfgBrightness) {
+      dma_display->setBrightness8(cfgBrightness);
+      lastAppliedBrightness = cfgBrightness;
+    }
+    return;
+  }
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 10)) return; // NTP not synced yet -- leave brightness as-is rather than guess
+
+  int hour = timeinfo.tm_hour;
+  bool isNight;
+  if (cfgNightStartHour == cfgNightEndHour) {
+    isNight = false; // degenerate zero-length window -- treat as always-day, not always-night
+  } else if (cfgNightStartHour < cfgNightEndHour) {
+    isNight = (hour >= cfgNightStartHour && hour < cfgNightEndHour);
+  } else {
+    // Window spans midnight, e.g. 23 -> 6.
+    isNight = (hour >= cfgNightStartHour || hour < cfgNightEndHour);
+  }
+
+  uint8_t target = isNight ? cfgNightBrightness : cfgBrightness;
+  if (lastAppliedBrightness != target) {
+    dma_display->setBrightness8(target);
+    lastAppliedBrightness = target;
+  }
+}
+
 // Idle screen shown whenever there's no aircraft payload loaded (i.e. after
 // /api/clear, or before the first /api/display). NTP sync runs in the
 // background from setupNTP(); until getLocalTime() first succeeds, this
@@ -1664,8 +1998,19 @@ void drawClock() {
 }
 
 unsigned long lastWiFiCheck = 0;
+unsigned long lastBrightnessCheck = 0;
 
 void loop() {
+  esp_task_wdt_reset(); // fed every iteration -- see setupWatchdog()
+
+  // Brightness/night-mode changes at most twice a day (entering/leaving the
+  // night window), so a 30s check interval is cheap and still responsive.
+  unsigned long nowBrightness = millis();
+  if (nowBrightness - lastBrightnessCheck >= 30000) {
+    lastBrightnessCheck = nowBrightness;
+    applyBrightnessForTime();
+  }
+
   // setupWiFi() only blocks-until-connected once at boot -- with no recovery
   // path, a dropped connection (router reboot, brief outage) would otherwise
   // leave the board silently unreachable until it's power-cycled by hand.
@@ -1681,6 +2026,18 @@ void loop() {
   }
 
   server.handleClient();
+
+  // Staleness check: if n8n stops pushing -- workflow deactivated, the n8n
+  // host down, a network blip -- the panel would otherwise keep showing
+  // whatever aircraft was last pushed forever, with no indication the data
+  // is old. lastDisplayPush == 0 means no push has landed yet this boot --
+  // nothing to time out from, so that case is skipped (the idle clock just
+  // shows normally, same as it always has).
+  if (lastDisplayPush != 0 && (unsigned long)(millis() - lastDisplayPush) >= STALE_TIMEOUT_MS) {
+    consoleLog.println("No display push in STALE_TIMEOUT_MS -- falling back to clock");
+    clearAircraftState();
+    lastDisplayPush = 0; // don't re-trigger every loop() until the next real push
+  }
 
   // Cast to unsigned long makes this subtraction wrap correctly even across
   // a millis() rollover (~49 days), so this doesn't need its own overflow
