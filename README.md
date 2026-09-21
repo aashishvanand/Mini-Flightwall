@@ -2,7 +2,7 @@
 
 A 64×64 RGB LED matrix that shows whatever aircraft is currently flying overhead — flight number, altitude, airline logo, aircraft type, and route — updated automatically every 30 seconds. When there's nothing overhead, it falls back to a clock.
 
-An n8n workflow polls [OpenSky Network](https://opensky-network.org/) for aircraft near a configured home location, enriches the match with route/aircraft-type data from [adsbdb](https://www.adsbdb.com/), and POSTs a JSON payload to a small HTTP server running on an ESP32-S3.
+An n8n workflow polls [OpenSky Network](https://opensky-network.org/) and [FlightRadar24](https://www.flightradar24.com/)'s live feed for aircraft near a configured home location, enriches the match with route/aircraft-type data from [adsbdb](https://www.adsbdb.com/) (cross-checked against FR24's live data, since adsbdb's callsign→route table can be stale), and POSTs a JSON payload to a small HTTP server running on an ESP32-S3.
 
 | ![Singapore Airlines](Singapore%20Airlines.bmp) | ![Cathay Pacific](Cathay%20Pacific.bmp) | ![Malaysian Airlines](Malaysian%20Airlines.bmp) | ![Air India](Air%20India.bmp) |
 |---|---|---|---|
@@ -13,8 +13,11 @@ An n8n workflow polls [OpenSky Network](https://opensky-network.org/) for aircra
 
 ```
 n8n (every 30s)
-  -> OpenSky Network  (nearest aircraft near HOME_LAT/HOME_LON)
+  -> OpenSky Network + FlightRadar24  (nearest aircraft near HOME_LAT/HOME_LON,
+                                        merged/de-duplicated by icao24)
   -> adsbdb           (route + aircraft type lookup by callsign / icao24)
+  -> FlightRadar24    (cross-checks adsbdb's route; falls back to FR24's live
+                        route/aircraft type when adsbdb has nothing or looks stale)
   -> HTTP POST /api/display  -> ESP32-S3 -> 64x64 HUB75 panel
 ```
 
@@ -41,10 +44,14 @@ You'll also need:
 ```
 matrix64/
   03_aircraft_display/    Aircraft Overhead Display -- production firmware
+    web/                  Admin console SPA (React + MUI) -- deployed to the board's
+                          FATFS partition, not baked into the firmware, see
+                          "Admin web console" below
 icons/                    Preprocessed 24x24 raw RGB565 airline-logo icons (copy to SD card /icons)
 tools/
   convert_tiles.py        Converts source logo images (webp/png/jpg) to the icons/*.bin format
-matrix64_aircraft_workflow.json   n8n workflow: OpenSky -> adsbdb -> matrix
+  deploy_web.py           Builds web/ and pushes it to a board's FATFS partition
+matrix64_aircraft_workflow.json   n8n workflow: OpenSky+FR24 -> adsbdb (FR24-verified) -> matrix
 ```
 
 ## Assembly / wiring
@@ -102,7 +109,7 @@ cp secrets.h.example secrets.h
 
 Icons are 24×24 raw RGB565 pixel dumps — no file header, 1,152 bytes each — because that's the simplest format the ESP32 can load straight into a `uint16_t` buffer with no decoding at runtime. `icons/` in this repo already has the pre-converted `.bin` files for a couple hundred airline codes; copy the ones you need onto the SD card under `/icons/`. The filename (minus `.bin`) is the `icon` key sent in the JSON payload, e.g. `sq_logo.bin` for Singapore Airlines.
 
-The n8n workflow's **Build Payload** node resolves which icon to send: it tries the airline's IATA code first, falls back to its ICAO code if there's no icon for the IATA (or no IATA at all, e.g. military/cargo callsigns), and falls back to `00_logo` (a blank tail) if neither has one — so a missing icon reads as "no art yet" instead of a stale or wrong logo. That node keeps a hardcoded `AVAILABLE_ICONS` set of every code currently in `icons/`; regenerate it (`ls icons | sed 's/_logo\.bin$//' | sort`) and paste it back in whenever you add or remove icons.
+The n8n workflow's **Build Payload (Matrix64)** node resolves which icon to send: it tries the airline's IATA code first, falls back to its ICAO code if there's no icon for the IATA (or no IATA at all, e.g. military/cargo callsigns), and falls back to `00_logo` (a blank tail) if neither has one — so a missing icon reads as "no art yet" instead of a stale or wrong logo. That node keeps a hardcoded `AVAILABLE_ICONS` set of every code currently in `icons/`; regenerate it (`ls icons | sed 's/_logo\.bin$//' | sort`) and paste it back in whenever you add or remove icons.
 
 To add or regenerate icons from source logo images (`.webp`, `.png`, `.jpg`):
 
@@ -125,20 +132,21 @@ All three end up in the same place: SD's `/icons/` is the durable source of trut
 
 Icons are hosted as static files on any S3-compatible object storage (or really, anything served over plain HTTPS) — the firmware just does a `GET`, no vendor SDK or API involved:
 
-- **At boot**, right after WiFi connects and before the HUB75 DMA starts (the SD card is unreliable once it's running), `syncIcons(true)` GETs `manifest.json` from `ICON_BASE_URL`, downloads whatever's missing or changed, writes it to `/icons/` on the SD card, and loads it into PSRAM.
+- **At boot**, right after WiFi connects and before the HUB75 DMA starts (the SD card is unreliable once it's running), `syncIcons(true)` GETs `manifest.json` from the configured base URL, downloads whatever's missing or changed, writes it to `/icons/` on the SD card, and loads it into PSRAM.
 - **Every `ICON_SYNC_INTERVAL_MS`** (3 days by default) while running, `loop()` calls `syncIcons(false)` — same manifest diff, but PSRAM-only, since SD can't be touched once the display's DMA is active. Those updates get persisted to SD on the next reboot regardless.
+- **On demand**, the Config tab's **Sync now** button (`POST /api/icons/sync`) runs the same PSRAM-only pass immediately, instead of waiting up to 3 days — useful right after changing the URL or updating the remote manifest.
 
 `manifest.json` is a JSON array of `{"name", "sha256"}` — the SHA-256 lets the firmware tell "already have this" apart from "have a file by this name but the art changed," and download only what's actually different.
 
 **Security against a MITM or malicious proxy:** every request validates the server's TLS certificate against the ESP32 core's built-in CA bundle (`useBuiltinCACertBundle()`, not `setInsecure()`) and disables HTTP redirects, so a network attacker can't substitute a different host or downgrade the connection. On top of that, every downloaded icon's SHA-256 is checked against the hash the manifest declared for it — fetched over that same validated connection — before it's written to SD or shown on the panel; a mismatch is dropped silently rather than displayed. This also means a compromised object (even one served with a technically-valid cert) gets caught by the hash check as long as the manifest itself wasn't tampered with in the same request.
 
-In `matrix64/03_aircraft_display/secrets.h`, set `ICON_BASE_URL` to `<base>/<prefix>` (no trailing slash) — `<base>/manifest.json` and `<base>/<name>.bin` must both resolve. Leaving it unset skips the sync entirely — the SD card's existing icons still work. This value is public info (it's just a URL your board fetches from over plain HTTPS) but stays out of the repo since it lives in the gitignored `secrets.h`, not `secrets.h.example`.
+**Setting the base URL:** it's a runtime setting (NVS-backed, like hostname/brightness/etc.), editable live from the admin console's **Config** tab — no reflash needed, and it takes effect on the next sync (or immediately via **Sync now**). `secrets.h`'s `ICON_BASE_URL` is only the *seed* value used the first time the board boots with an empty NVS; from then on the Config tab value wins. Either way it's `<base>/<prefix>` with no trailing slash — `<base>/manifest.json` and `<base>/<name>.bin` must both resolve. Leaving it empty skips the sync entirely — the SD card's existing icons still work.
 
 Any S3-compatible bucket with public HTTPS access works — Cloudflare R2, AWS S3, MinIO, Backblaze B2, etc. `tools/sync_icons_r2.sh` is the reference implementation, using R2 (chosen for free egress and an S3-compatible API):
 
 1. `wrangler login`, then `wrangler r2 bucket create <bucket-name>`.
 2. In the Cloudflare dashboard, open the bucket → **Settings** → **Public access** → **Allow Access**, and copy the `r2.dev` URL, or attach a custom domain (e.g. `data.airportdata.dev`).
-3. Set `ICON_BASE_URL` as described above.
+3. Set the base URL from the admin console's Config tab (or `ICON_BASE_URL` in `secrets.h` before first boot).
 
 Whenever `icons/` changes:
 
@@ -146,49 +154,81 @@ Whenever `icons/` changes:
 ./tools/sync_icons_r2.sh <bucket-name> [prefix]
 ```
 
-`prefix` defaults to `24x24` to match the layout above; pass `""` to upload to the bucket root instead. This uploads every `icons/*.bin` plus a `manifest.json` with each one's SHA-256. New/changed icons show up within one sync interval; reboot to pick them up immediately. On a different S3-compatible provider, upload the same `icons/*.bin` files plus a matching `manifest.json` (name + sha256 per file) however that provider's tooling works (`aws s3 cp`, `mc mirror`, rclone, etc.) — the firmware doesn't care how the files got there, only that they're reachable over HTTPS at `ICON_BASE_URL`.
+`prefix` defaults to `24x24` to match the layout above; pass `""` to upload to the bucket root instead. This uploads every `icons/*.bin` plus a `manifest.json` with each one's SHA-256. New/changed icons show up within one sync interval, or immediately via the Config tab's **Sync now** button. On a different S3-compatible provider, upload the same `icons/*.bin` files plus a matching `manifest.json` (name + sha256 per file) however that provider's tooling works (`aws s3 cp`, `mc mirror`, rclone, etc.) — the firmware doesn't care how the files got there, only that they're reachable over HTTPS at the configured base URL.
 
 Object storage was chosen over Cloudflare Images because the `.bin` files are headerless raw RGB565 dumps, not a format Images can store or serve — Images is built for re-encoding/serving actual photos, not arbitrary binary blobs.
 
 ## n8n workflow setup
 
-`matrix64_aircraft_workflow.json` here is a standalone template (OpenSky-only,
-single-device push) for anyone running just the matrix panel on its own.
+`matrix64_aircraft_workflow.json` here is a standalone, self-contained
+template — just the matrix panel's branch, no Ulanzi AWTRIX/TC002 clock
+nodes. It's the same logic this build's actual feeder runs for the matrix
+(the real feeder's workflow additionally drives two Ulanzi clocks off the
+same position/route data — see the sibling `Ulanzi Feeder` repo's
+`n8n_aircraft_workflow.json` if you want that combined setup instead).
 
-**This build's actual feeder doesn't run that file.** The matrix panel is one
-push target on a shared workflow that also drives two Ulanzi AWTRIX/TC002
-clocks — see the sibling `Ulanzi Feeder` repo's `n8n_aircraft_workflow.json`
-for the full picture (dual-source OpenSky + FlightRadar24 positioning, route
-verification, per-device payload builders). That workflow's **Config** node
-holds one shared `HOME_LAT`/`HOME_LON`/`RADIUS_DEG` and OpenSky credentials
-for all three devices, plus a `MATRIX_IP` for this panel; its **Compare
-Routes** node feeds a `Build Payload (Matrix64)` branch that reconstructs
-this repo's full payload shape (airline, altitude, city names, aircraft
-type) using this repo's `Lookup Aircraft (adsbdb)` node and 24×24 icon set,
-then `POST`s to `Push to Matrix` / `Clear Matrix` exactly as described below.
+Nodes, in order:
 
-If you *are* running the matrix standalone (no Ulanzi clocks), import
-`matrix64_aircraft_workflow.json` instead and fill in:
+```
+Every 30s
+  -> Config (edit per location)
+  -> Get/Refresh OpenSky Token -> Fetch Nearby States (OpenSky)   -\
+     Fetch Nearby States (FR24)                                    >-- Merge Position Data -> Nearest Aircraft
+  -> Aircraft Found?
+       true  -> Lookup Route (adsbdb)  -\
+                Verify Route (FR24)      >-- Merge Route Data -> Compare Routes -\
+                Lookup Aircraft (adsbdb) -------------------------------------- >-- Merge Matrix Data -> Build Payload (Matrix64) -> Push to Matrix
+       false -> Clear Matrix
+```
+
+- **Position**: OpenSky and FlightRadar24's live feed are merged and
+  de-duplicated by `icao24` — the two networks' ADS-B ground receivers
+  overlap but aren't identical, so combining them catches aircraft one
+  network's receivers missed but the other's caught.
+- **Route**: adsbdb resolves a callsign to an airline/origin/destination,
+  but that table is static and can go stale (flight numbers get reused
+  across seasons/codeshares). `Compare Routes` cross-checks it against
+  FlightRadar24's live feed for the same callsign and trusts the FR24
+  match when one exists; adsbdb's route is only used when FR24 has
+  nothing *and* the aircraft's current position is geographically
+  plausible for adsbdb's claimed origin/destination.
+- **Aircraft type**: adsbdb's `/v0/aircraft/{icao24}` lookup is the
+  richer source (full manufacturer name + ICAO type), but doesn't have
+  every hex (private/GA aircraft, newly registered, or a hex reassigned
+  since adsbdb's table was last refreshed). When it has nothing, `Build
+  Payload (Matrix64)` falls back to the bare type code FlightRadar24's
+  live feed reports for that `icao24` (no manufacturer name, just
+  e.g. `B738`).
+
+Import `matrix64_aircraft_workflow.json` and fill in:
    - `HOME_LAT` / `HOME_LON` — your location's coordinates (placeholders are `0.0` — replace before running)
    - `RADIUS_DEG` — search radius in degrees (default `0.15` ≈ ~16km)
    - `MATRIX_IP` — your ESP32's LAN IP (placeholder `192.168.1.50`)
    - `OPENSKY_CLIENT_ID` / `OPENSKY_CLIENT_SECRET` — from your [OpenSky API client credentials](https://opensky-network.org/apidoc/rest.html#authentication)
 
-Then activate it. It polls every 30 seconds, finds the nearest airborne aircraft, looks up its route and aircraft type, and pushes a display payload to the matrix.
+Then activate it. It polls every 30 seconds, finds the nearest airborne aircraft, looks up and verifies its route and aircraft type, and pushes a display payload to the matrix. FlightRadar24's feed here is its unofficial public `data-cloud.flightradar24.com/zones/fcgi/feed.js` endpoint — no API key, but no uptime/rate-limit guarantee either; if it's ever unreachable, the workflow just falls back to OpenSky-only positioning and adsbdb-only routing (via the plausibility check above), same as before FR24 was added.
 
 ### Payload shape
 
 ```json
 {
   "flight": "SQ123",
-  "airline": "Singapore Airlines",
   "altitudeFt": 35000,
+  "speedKt": 460, "verticalRateFpm": 1200,
+  "airline": "Singapore Airlines",
   "originCode": "SIN", "destCode": "KUL",
   "originCity": "Singapore Changi Airport",
   "destCity": "Kuala Lumpur International Airport",
   "icon": "sq_logo", "make": "Airbus", "modelShort": "A388"
 }
 ```
+
+`speedKt` / `verticalRateFpm` are `null` when the source feed didn't report
+them for that aircraft (firmware omits the line rather than showing `0`).
+`originCity`/`destCity`/`airline` are only present when adsbdb's route data
+was trusted (see "n8n workflow setup" above) — a FR24-sourced route still
+sets `originCode`/`destCode`/`icon`, just without the city names or airline
+name adsbdb would have added.
 
 ## API reference (firmware)
 
@@ -206,31 +246,59 @@ normal operation, they exist for the page's own JS to call.
 |---|---|---|
 | `/` | GET | Admin dashboard -- live preview, status, icon browser, WiFi scan, config, log, reboot, firmware update |
 | `/api/status` | GET | JSON status snapshot (uptime, heap/PSRAM, WiFi, icon count, current config, what's showing) |
-| `/api/config` | POST | Update hostname / brightness / timezone override / night mode (form-encoded, persisted to NVS). **Requires HTTP Basic Auth** |
+| `/api/config` | POST | Update hostname / brightness / timezone override / night mode / icon sync base URL (form-encoded, persisted to NVS). **Requires HTTP Basic Auth** |
 | `/api/reboot` | POST | Reboot the board |
 | `/api/log` | GET | Tail of the in-memory log ring buffer (plain text) |
 | `/api/icons` | GET | JSON array of every icon name currently loaded in PSRAM |
 | `/api/icon.bmp?name=<n>` | GET | A single icon's pixels as a BMP (for the admin page's icon grid) |
+| `/api/icons/sync` | POST | Manually run a remote icon sync now (PSRAM only) instead of waiting for the next periodic pass. Blocks ~1-2s+ depending on how much changed; the panel's scroll will visibly pause, same as `/api/wifi/scan` |
 | `/api/icons/delete?name=<n>` | POST | Remove an icon from PSRAM now; actually deleted from the SD card on next reboot (SD can't be touched while the display's DMA is running -- see "Icons" above) |
 | `/api/icons/upload` | POST | Upload a 24x24 raw565 `.bin` (multipart/form-data) -- stages to internal flash (FATFS, no DMA-unsafe window), loads into PSRAM immediately, merged onto the SD card on next reboot. See "Icon upload via the admin console" below |
 | `/api/wifi/scan` | GET | JSON list of nearby SSIDs (blocks ~1-2s; the panel's scroll will visibly pause) |
 | `/api/ota` | POST | Flash a new firmware `.bin` (multipart/form-data) and reboot into it. **Requires HTTP Basic Auth** -- see "OTA firmware updates" below |
+| `/api/web/upload` | POST | Write one file (multipart/form-data, field `file`, uploaded with its filename set to the relative target path, e.g. `assets/index-XYZ.js.gz`) to `/web/<filename>` on the FATFS partition. **Requires HTTP Basic Auth**. Used by `tools/deploy_web.py`, not meant to be called by hand |
+| `/api/web/clear` | POST | Recursively delete everything under `/web/` on FATFS, ahead of a fresh deploy. **Requires HTTP Basic Auth** |
 
 ## Admin web console
 
-`http://<board-ip>/` -- a live dashboard, not just a status page: the panel
-preview and status numbers auto-refresh via JS polling `/api/status` and
+`http://<board-ip>/` -- a React + MUI single-page app (source under
+`matrix64/03_aircraft_display/web/`), not a status page: the panel preview
+and status numbers auto-refresh via JS polling `/api/status` and
 `/debug/screenshot.bmp` (no need to reload the page). From it you can browse
 and delete loaded icons, upload new ones, scan for WiFi networks, watch the
 live log, edit hostname/brightness/timezone-override, reboot, and flash new
 firmware -- all documented in the API table above.
 
+Unlike the previous plain-HTML version, the built app isn't baked into the
+firmware image at all -- it's deployed separately as static files on the
+board's internal FATFS partition (`/web/`, the same 22MB FATFS partition
+described in "Arduino IDE setup"), served by `handleWebStatic()` in the
+firmware. That partition has no DMA-unsafe window (unlike the SD card), so
+it's safe to read/write at any time, including while the display is
+running. This means UI changes can be redeployed without a full firmware
+reflash, and there's no realistic firmware-size pressure from the UI's
+bundle size (React + MUI, gzipped, is well under 1% of the partition).
+
+To build and deploy it:
+
+```bash
+python3 tools/deploy_web.py <board-ip>
+```
+
+`deploy_web.py` runs `npm install`/`npm run build` in `web/` (skip with
+`--skip-build` if you've already built it), gzips every output file (the
+firmware only ever looks up `<path>.gz` on FATFS), clears `/web/` on the board first
+(Vite hashes output filenames per build, so stale files from a previous
+deploy would otherwise accumulate forever), then uploads everything via
+`/api/web/upload`. It prompts for the admin credentials the same way the
+OTA/config endpoints do -- see below.
+
 Like every other endpoint on this board, most of the console has **no
 authentication** -- it trusts the LAN the same way `/api/display` always
 has. That's an explicit, accepted tradeoff for a board that's meant to
-never be exposed to the WAN, not an oversight. The two exceptions --
-changing config and flashing firmware -- are gated behind HTTP Basic Auth;
-see "OTA firmware updates" below for why those two specifically.
+never be exposed to the WAN, not an oversight. Changing config, flashing
+firmware, and deploying the web console itself are the exceptions, gated
+behind HTTP Basic Auth; see "OTA firmware updates" below for why.
 
 ### Icon upload via the admin console
 
@@ -260,16 +328,17 @@ The Firmware update section of `/` accepts a compiled `.bin` (Arduino IDE:
 practical -- see "Arduino IDE setup"), rebooting into it automatically on
 success.
 
-Unlike every other endpoint on this board, `/api/ota` (and `/api/config`,
-which can change the hostname or force a timezone) require HTTP Basic Auth
--- your browser will prompt once and cache the credentials for the origin.
-Set `ADMIN_USER`/`ADMIN_PASSWORD` in `secrets.h` (see `secrets.h.example`);
-left unset, both fall back to `admin`/`changeme`, which is fine for a
-private LAN but the firmware logs a warning at boot if you're still on it.
-Every other endpoint stays unauthenticated, same LAN-only trust model as
-always -- these two specifically were judged too risky to leave open (a bad
-`/api/display` push shows a wrong flight number; a bad `/api/ota` push
-replaces the firmware).
+Unlike every other endpoint on this board, `/api/ota`, `/api/web/upload`,
+`/api/web/clear` (all three: arbitrary writes to internal flash), and
+`/api/config` (which can change the hostname or force a timezone) require
+HTTP Basic Auth -- your browser will prompt once and cache the credentials
+for the origin. Set `ADMIN_USER`/`ADMIN_PASSWORD` in `secrets.h` (see
+`secrets.h.example`); left unset, both fall back to `admin`/`changeme`,
+which is fine for a private LAN but the firmware logs a warning at boot if
+you're still on it. Every other endpoint stays unauthenticated, same
+LAN-only trust model as always -- these specifically were judged too risky
+to leave open (a bad `/api/display` push shows a wrong flight number; a bad
+`/api/ota` or `/api/web/upload` push replaces the firmware or the console).
 
 **Automatic rollback:** if a flashed firmware image fails to reach the end
 of `setup()` three boots in a row -- crashing or hanging every time, before

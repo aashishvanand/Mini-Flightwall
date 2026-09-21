@@ -19,21 +19,27 @@
 // then copy icons/*.bin to /icons/ on the SD card (not the raw tailfin/
 // source images -- those are full-size .webp/.png, not decodable on-device).
 //
-// Remote icon sync: syncIcons() GETs manifest.json from ICON_BASE_URL (any
+// Remote icon sync: syncIcons() GETs manifest.json from cfgIconBaseUrl (any
 // S3-compatible bucket or plain HTTPS host works -- no vendor SDK involved)
 // -- a JSON array of {"name", "sha256"} -- and downloads whatever's missing
-// or whose hash changed. Runs twice, via the same function with different
-// persistToSD:
+// or whose hash changed. Runs three ways:
 //   - at boot, right after WiFi connects and before setupMatrix() starts
 //     the DMA (SD is still safe to touch): writes new/updated icons to
 //     /icons/ AND loads them into PSRAM, so they survive next boot even
 //     offline.
 //   - periodically from loop() (every ICON_SYNC_INTERVAL_MS): PSRAM only,
 //     SD is never touched again once the DMA is running (see note above).
+//   - on demand via POST /api/icons/sync (the Config tab's "Sync now"
+//     button) -- same PSRAM-only path as the periodic case, for right
+//     after changing the URL below or updating the remote manifest,
+//     instead of waiting up to ICON_SYNC_INTERVAL_MS.
 // So a new or updated airline logo shows up within one sync interval with
 // no SD card pull required. Build/upload with tools/sync_icons_r2.sh (an
 // R2-based reference implementation); see README "Remote icon sync".
-// Skipped entirely if ICON_BASE_URL isn't set in secrets.h.
+// Skipped entirely if the URL is empty. secrets.h's ICON_BASE_URL is only
+// the seed value for first boot -- cfgIconBaseUrl (NVS-backed, editable
+// from the Config tab) is what's actually used from then on; see
+// loadConfig().
 //
 // Security: every download goes over TLS validated against ESP32's bundled
 // CA root store (useBuiltinCACertBundle()) -- not setInsecure() -- and redirects are
@@ -133,6 +139,14 @@ void applyBrightnessForTime();
 // implemented in terms of write(), so overriding just write() here gets
 // every existing call site working via a simple s/Serial\./consoleLog./
 // rename, no call-site rewrites needed.
+// Bump this on every change you flash (major.minor.patch) -- shown in the
+// admin console's footer (see handleStatus()) so it's obvious at a glance
+// which build a board is running, and used by /api/ota's downgrade guard
+// below (see parseVersion()/isVersionOlder()). Not read from a git tag or
+// any build-time codegen -- this is a plain Arduino sketch with no such
+// step -- so it's a plain literal you edit by hand alongside the change.
+#define FIRMWARE_VERSION "1.2.3"
+
 #define LOG_BUFFER_SIZE 4096
 class Logger : public Print {
 public:
@@ -172,10 +186,12 @@ Logger consoleLog;
 // directly -- no manual symbol/size plumbing needed (core >=3.x removed the
 // single-arg setCACertBundle(bundle) overload this used to call).
 
-// Base URL icons are synced from, e.g. "https://data.airportdata.dev/24x24"
-// (no trailing slash -- <base>/manifest.json and <base>/<name>.bin are
-// fetched directly). Define in secrets.h to enable syncIcons(); left unset
-// here as a no-op default so builds without it configured still compile.
+// Default base URL icons are synced from, e.g.
+// "https://data.airportdata.dev/24x24" (no trailing slash -- see
+// cfgIconBaseUrl above). Only used to seed NVS on a virgin boot -- once
+// set (by this default or the Config tab), NVS is what's actually read.
+// Define in secrets.h to change the seed value; left unset here as a no-op
+// default so builds without it configured still compile.
 #ifndef ICON_BASE_URL
 #define ICON_BASE_URL ""
 #endif
@@ -280,12 +296,20 @@ bool cfgNightModeEnabled;    // true = dim to cfgNightBrightness between cfgNigh
 uint8_t cfgNightBrightness;  // brightness during the night window
 uint8_t cfgNightStartHour;   // 0-23, local time (per the resolved/overridden timezone)
 uint8_t cfgNightEndHour;     // 0-23 -- start > end means the window spans midnight (e.g. 23 -> 6)
+String cfgIconBaseUrl;       // syncIcons()'s base URL -- editable from the Config tab; seeded from
+                              // secrets.h's ICON_BASE_URL on first boot (empty disables sync), see
+                              // loadConfig() below
+String cfgNtpServer;         // setupNTP()'s primary NTP server (hostname or bare IP) -- editable
+                              // from the Config tab; the secondary ("time.nist.gov") stays fixed as
+                              // a hardcoded fallback. Useful when pool.ntp.org is blocked/slow on a
+                              // given network, or to point at a LAN NTP server instead.
 
 #define DEFAULT_HOSTNAME "miniflightwall"
 #define DEFAULT_BRIGHTNESS 60
 #define DEFAULT_NIGHT_BRIGHTNESS 10
 #define DEFAULT_NIGHT_START_HOUR 23
 #define DEFAULT_NIGHT_END_HOUR 6
+#define DEFAULT_NTP_SERVER "pool.ntp.org"
 
 void loadConfig() {
   prefs.begin("mf", false); // false = read/write
@@ -297,6 +321,12 @@ void loadConfig() {
   cfgNightBrightness = prefs.getUChar("nightBright", DEFAULT_NIGHT_BRIGHTNESS);
   cfgNightStartHour = prefs.getUChar("nightStart", DEFAULT_NIGHT_START_HOUR);
   cfgNightEndHour = prefs.getUChar("nightEnd", DEFAULT_NIGHT_END_HOUR);
+  // ICON_BASE_URL (the #define, from secrets.h) is only ever the *default*
+  // now -- read once here as the fallback for a virgin NVS, then never
+  // referenced again. Once saved via /api/config, NVS wins on every boot
+  // after, same as every other cfg* field.
+  cfgIconBaseUrl = prefs.getString("iconBaseUrl", ICON_BASE_URL);
+  cfgNtpServer = prefs.getString("ntpServer", DEFAULT_NTP_SERVER);
 }
 
 String currentIcon = "";
@@ -339,6 +369,46 @@ unsigned long lastDisplayPush = 0;
                                             // interval, short enough that a
                                             // real outage doesn't sit
                                             // unnoticed for long
+
+// Parses a "major.minor.patch" string (e.g. FIRMWARE_VERSION, or the
+// "version" field /api/ota's uploader declares) into three ints. Returns
+// false on anything that doesn't look like exactly that shape -- a missing
+// part or non-digit content -- rather than defaulting unparseable parts to
+// 0, so isVersionOlder() below can tell "not a version string" apart from
+// "an actual older version" and the OTA handler can choose not to block on
+// the former (an unparseable declared version isn't evidence of anything).
+bool parseVersion(const String &v, int *major, int *minor, int *patch) {
+  int firstDot = v.indexOf('.');
+  int secondDot = firstDot < 0 ? -1 : v.indexOf('.', firstDot + 1);
+  if (firstDot < 0 || secondDot < 0) return false;
+  String a = v.substring(0, firstDot);
+  String b = v.substring(firstDot + 1, secondDot);
+  String c = v.substring(secondDot + 1);
+  if (a.length() == 0 || b.length() == 0 || c.length() == 0) return false;
+  for (size_t i = 0; i < a.length(); i++) if (!isdigit((unsigned char)a[i])) return false;
+  for (size_t i = 0; i < b.length(); i++) if (!isdigit((unsigned char)b[i])) return false;
+  for (size_t i = 0; i < c.length(); i++) if (!isdigit((unsigned char)c[i])) return false;
+  *major = a.toInt();
+  *minor = b.toInt();
+  *patch = c.toInt();
+  return true;
+}
+
+// True only if `candidate` parses as strictly older than `current`. Used by
+// /api/ota (see handleOtaData()) to flag a likely-accidental downgrade --
+// deliberately fails open (returns false, i.e. "not older, don't block") on
+// anything it can't parse, since this is a convenience guard for the
+// legitimate admin, not a security boundary (whoever's calling /api/ota
+// already has the admin credentials).
+bool isVersionOlder(const String &candidate, const String &current) {
+  int cMaj, cMin, cPat, curMaj, curMin, curPat;
+  if (!parseVersion(candidate, &cMaj, &cMin, &cPat) || !parseVersion(current, &curMaj, &curMin, &curPat)) {
+    return false;
+  }
+  if (cMaj != curMaj) return cMaj < curMaj;
+  if (cMin != curMin) return cMin < curMin;
+  return cPat < curPat;
+}
 
 int findIconIndex(const String &name) {
   for (int i = 0; i < iconCount; i++) {
@@ -442,6 +512,84 @@ bool downloadAndVerifyIcon(const String &url, uint16_t *buf, const uint8_t *expe
   return true;
 }
 
+// One attempt at fetching + parsing manifest.json into `manifest`. Reads
+// the full body into a buffer first, checked against the server-declared
+// Content-Length, rather than handing http.getStream() straight to
+// deserializeJson() -- a short/dropped read then shows up as an explicit
+// "got fewer bytes than declared" (via *errOut) instead of ArduinoJson's
+// much vaguer "IncompleteInput", and the caller (syncIcons()) can retry on
+// that instead of treating one flaky transfer as fatal for the whole sync.
+// Falls back to the old direct-stream-parse path only if the server
+// doesn't declare a Content-Length at all (shouldn't happen for a static
+// R2/S3-style manifest.json, but better than hanging indefinitely).
+bool fetchManifestOnce(const String &url, JsonDocument &manifest, String *errOut) {
+  WiFiClientSecure manifestClient;
+  manifestClient.useBuiltinCACertBundle();
+  HTTPClient http;
+  http.setTimeout(20000);
+  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+  if (!http.begin(manifestClient, url)) {
+    *errOut = "failed to start manifest request";
+    return false;
+  }
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    *errOut = "manifest GET failed (HTTP " + String(code) + ")";
+    http.end();
+    return false;
+  }
+
+  int expected = http.getSize(); // Content-Length; -1 if unknown/chunked
+  WiFiClient *stream = http.getStreamPtr();
+  if (expected <= 0) {
+    DeserializationError err = deserializeJson(manifest, *stream);
+    http.end();
+    if (err) {
+      *errOut = String("bad manifest JSON (") + err.c_str() + ")";
+      return false;
+    }
+    return true;
+  }
+
+  String body;
+  body.reserve(expected);
+  uint8_t chunk[512];
+  int total = 0;
+  unsigned long deadline = millis() + 20000;
+  unsigned long lastHeartbeat = millis();
+  while (total < expected && millis() < deadline) {
+    int avail = stream->available();
+    if (avail <= 0) {
+      // Console heartbeat every ~2s while waiting on data -- without this,
+      // a slow-but-progressing transfer and an actually-stuck one both
+      // print nothing, and it's impossible to tell them apart on the log.
+      if (millis() - lastHeartbeat > 2000) {
+        consoleLog.printf("Icon sync: ...%d/%d bytes\n", total, expected);
+        lastHeartbeat = millis();
+      }
+      delay(10);
+      continue;
+    }
+    int toRead = avail < (int)sizeof(chunk) ? avail : (int)sizeof(chunk);
+    int got = stream->readBytes(chunk, toRead);
+    if (got <= 0) break;
+    body.concat((const char *)chunk, got);
+    total += got;
+  }
+  http.end();
+  if (total != expected) {
+    *errOut = "short read: got " + String(total) + "/" + String(expected) + " bytes";
+    return false;
+  }
+
+  DeserializationError err = deserializeJson(manifest, body);
+  if (err) {
+    *errOut = String("bad manifest JSON (") + err.c_str() + ")";
+    return false;
+  }
+  return true;
+}
+
 // Fetches manifest.json (a JSON array of {"name","sha256"}, e.g.
 // [{"name":"sq_logo","sha256":"...64 hex chars..."}, ...]) and downloads
 // whichever entries are missing or whose hash doesn't match what's already
@@ -453,38 +601,51 @@ bool downloadAndVerifyIcon(const String &url, uint16_t *buf, const uint8_t *expe
 // only; those updates are re-synced (and then persisted) on the
 // next reboot regardless.
 void syncIcons(bool persistToSD) {
-  if (strlen(ICON_BASE_URL) == 0) {
-    consoleLog.println("Icon sync: ICON_BASE_URL not set, skipping");
+  if (cfgIconBaseUrl.length() == 0) {
+    consoleLog.println("Icon sync: base URL not set, skipping");
     return;
   }
 
-  WiFiClientSecure manifestClient;
-  manifestClient.useBuiltinCACertBundle();
-  HTTPClient http;
-  http.setTimeout(8000);
-  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-  if (!http.begin(manifestClient, String(ICON_BASE_URL) + "/manifest.json")) {
-    consoleLog.println("Icon sync: failed to start manifest request");
-    return;
-  }
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    consoleLog.printf("Icon sync: manifest GET failed (HTTP %d)\n", code);
-    http.end();
-    return;
-  }
+  consoleLog.printf("Icon sync: starting (base URL %s)\n", cfgIconBaseUrl.c_str());
 
   JsonDocument manifest;
-  DeserializationError err = deserializeJson(manifest, http.getStream());
-  http.end();
-  if (err) {
-    consoleLog.printf("Icon sync: bad manifest JSON (%s)\n", err.c_str());
+  bool manifestOk = false;
+  String manifestErr;
+  // Observed intermittently truncating (ArduinoJson's "IncompleteInput")
+  // even with a generous timeout and a manifest.json confirmed complete and
+  // correctly sized server-side -- this board's WiFi link occasionally
+  // drops/short-reads a large (tens of KB) transfer even though small
+  // (1152-byte) icon downloads and the TLS handshake itself are reliable.
+  // fetchManifestOnce() reads against the declared Content-Length so a
+  // short read is caught explicitly instead of surfacing as a vague parse
+  // error, and this retries a few times rather than treating one flaky
+  // transfer as fatal for the whole sync. Each attempt can legitimately
+  // take up to ~20s, so this logs before/after each one -- a silent gap
+  // that long otherwise looks identical to a genuine hang on the console.
+  for (int attempt = 1; attempt <= 3 && !manifestOk; attempt++) {
+    consoleLog.printf("Icon sync: fetching manifest.json (attempt %d/3)...\n", attempt);
+    manifest.clear();
+    manifestOk = fetchManifestOnce(cfgIconBaseUrl + "/manifest.json", manifest, &manifestErr);
+    if (!manifestOk) {
+      consoleLog.printf("Icon sync: manifest fetch attempt %d/3 failed (%s)\n", attempt, manifestErr.c_str());
+      if (attempt < 3) delay(1000);
+    }
+  }
+  if (!manifestOk) {
+    consoleLog.println("Icon sync: giving up on manifest after 3 attempts");
     return;
   }
 
+  int manifestTotal = manifest.as<JsonArray>().size();
+  consoleLog.printf("Icon sync: manifest OK, %d icons listed -- checking against %d already loaded\n", manifestTotal, iconCount);
+
   const size_t expectedBytes = ICON_SIZE * ICON_SIZE * 2;
-  int added = 0, updated = 0;
+  int added = 0, updated = 0, checked = 0;
   for (JsonObject entry : manifest.as<JsonArray>()) {
+    checked++;
+    if (checked % 50 == 0) {
+      consoleLog.printf("Icon sync: checked %d/%d (added %d, updated %d so far)\n", checked, manifestTotal, added, updated);
+    }
     String name = entry["name"] | "";
     String hashHex = entry["sha256"] | "";
     uint8_t expectedHash[32];
@@ -502,7 +663,7 @@ void syncIcons(bool persistToSD) {
       consoleLog.printf("Icon sync: PSRAM alloc failed for %s\n", name.c_str());
       continue;
     }
-    if (!downloadAndVerifyIcon(String(ICON_BASE_URL) + "/" + name + ".bin", buf, expectedHash)) {
+    if (!downloadAndVerifyIcon(cfgIconBaseUrl + "/" + name + ".bin", buf, expectedHash)) {
       free(buf);
       continue;
     }
@@ -932,8 +1093,32 @@ void setupNTP() {
   }
   // dst_offset is already folded into offsetSec above (or n/a on the
   // fallback path), so daylightOffset is always 0 here.
-  configTime(offsetSec, 0, "pool.ntp.org", "time.nist.gov");
-  consoleLog.println("NTP configured");
+  // cfgNtpServer is the admin-configurable primary server (Config tab,
+  // validated by isPlausibleNtpServer()); "time.nist.gov" stays a fixed
+  // secondary regardless, so a bad/unreachable primary still has a
+  // fallback instead of leaving the clock unsynced entirely.
+  configTime(offsetSec, 0, cfgNtpServer.c_str(), "time.nist.gov");
+  // configTime() only starts the SNTP exchange -- it returns immediately,
+  // before any reply has actually arrived over UDP. Returning right away
+  // would let syncIcons() (called right after this in setup()) race it:
+  // WiFiClientSecure's cert-validity check reads the system clock, and if
+  // it's still stuck at the Unix epoch every TLS handshake "fails" with a
+  // generic HTTP -1, no matter how correct the icon base URL is. Block
+  // briefly for the clock to actually cross a sane recent date -- 10s is
+  // comfortably more than NTP normally takes on a healthy connection --
+  // rather than just logging that configTime() was *called*.
+  time_t now = time(nullptr);
+  unsigned long waitStart = millis();
+  const time_t SANE_EPOCH = 1700000000; // 2023-11-14 -- just needs to be well past 1970
+  while (now < SANE_EPOCH && millis() - waitStart < 10000) {
+    delay(200);
+    now = time(nullptr);
+  }
+  if (now < SANE_EPOCH) {
+    consoleLog.println("NTP: time did not sync within 10s -- TLS-validated requests (icon sync) may fail this boot");
+  } else {
+    consoleLog.println("NTP configured");
+  }
 }
 
 void resetAllScrollPositions() {
@@ -962,6 +1147,9 @@ void handleDisplay() {
   String flight = doc["flight"] | "";
   currentIcon = doc["icon"] | "";
   currentIconBuf = findIcon(currentIcon);
+  if (currentIcon.length() > 0 && !currentIconBuf) {
+    consoleLog.printf("Push: icon \"%s\" not loaded (missing from SD/PSRAM) -- icon area will be blank\n", currentIcon.c_str());
+  }
   lineAirline = doc["airline"] | "";
   lineMake = doc["make"] | "";
   lineModelShort = doc["modelShort"] | "";
@@ -1133,6 +1321,19 @@ void handleIconList() {
   String out;
   serializeJson(doc, out);
   server.send(200, "application/json", out);
+}
+
+// POST /api/icons/sync -- manually runs syncIcons(false) (the same
+// PSRAM-only path as the periodic ICON_SYNC_INTERVAL_MS call from loop())
+// instead of waiting up to 3 days for the next automatic pass. Meant for
+// right after changing the icon base URL in Config, or after updating the
+// remote manifest. Blocks this request (and briefly stalls the panel's
+// scroll animation, since WebServer.h serves one request at a time) for as
+// long as the HTTPS fetch + any downloads take -- same tradeoff as
+// /api/wifi/scan: an infrequent manual action, not something to poll.
+void handleIconSync() {
+  syncIcons(false);
+  server.send(200, "application/json", "{\"ok\":true,\"iconCount\":" + String(iconCount) + "}");
 }
 
 // POST /api/icons/delete?name=<icon name> -- removes an icon from PSRAM
@@ -1330,19 +1531,55 @@ bool otaHasError = false;
 // library's request lifecycle supports safely. So this just remembers the
 // verdict and lets the (harmlessly discarded) body finish streaming through.
 bool otaUnauthorized = false;
+// Set instead of a generic otaHasError when the block was specifically a
+// downgrade guard trip (see below) -- handleOtaDone() uses this to send a
+// distinct 409 the admin console's FirmwareUpdate.jsx can recognize and
+// offer a "yes, downgrade anyway" resubmit for, instead of a flat failure.
+bool otaDowngradeBlocked = false;
+// Overrides the generic "update failed, see /api/log" message in
+// handleOtaDone() when set -- used for the downgrade message specifically,
+// which needs to say what it's actually blocking.
+String otaErrorMessage = "";
 
 void handleOtaData() {
   HTTPUpload &upload = server.upload();
 
   if (upload.status == UPLOAD_FILE_START) {
     otaHasError = false;
+    otaDowngradeBlocked = false;
+    otaErrorMessage = "";
     otaUnauthorized = !server.authenticate(ADMIN_USER, ADMIN_PASSWORD);
     if (otaUnauthorized) {
       otaHasError = true; // also short-circuits the WRITE/END branches below
       consoleLog.println("OTA: rejected (bad or missing credentials)");
       return;
     }
-    consoleLog.printf("OTA: starting update (%s)\n", upload.filename.c_str());
+
+    // Downgrade guard: FirmwareUpdate.jsx sends the .bin's own declared
+    // version as a "version" form field, appended to the FormData *before*
+    // the file field so it's already parsed into server.arg() by the time
+    // this file part starts arriving (ESP32 WebServer's multipart parser
+    // processes parts in request order). A missing or unparseable version
+    // doesn't block -- a bare curl upload or an older UI build simply won't
+    // send one, and that's not evidence of anything -- but a version that
+    // parses as strictly older than what's currently running does, unless
+    // the request also sets confirmDowngrade=1 (the UI's second, explicit
+    // "yes, really downgrade" dialog). This is a convenience guard against
+    // an accidental stale-.bin upload, not a security boundary: whoever's
+    // calling this endpoint at all already has the admin credentials.
+    String declaredVersion = server.arg("version");
+    bool confirmDowngrade = server.arg("confirmDowngrade") == "1";
+    if (declaredVersion.length() && isVersionOlder(declaredVersion, FIRMWARE_VERSION) && !confirmDowngrade) {
+      otaHasError = true;
+      otaDowngradeBlocked = true;
+      otaErrorMessage = "downgrade blocked: board is on " + String(FIRMWARE_VERSION) +
+                         ", upload is " + declaredVersion;
+      consoleLog.printf("OTA: rejected downgrade attempt (%s -> %s)\n", FIRMWARE_VERSION, declaredVersion.c_str());
+      return;
+    }
+
+    consoleLog.printf("OTA: starting update (%s, declared version %s)\n", upload.filename.c_str(),
+                       declaredVersion.length() ? declaredVersion.c_str() : "unknown");
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
       Update.printError(consoleLog);
       otaHasError = true;
@@ -1375,8 +1612,13 @@ void handleOtaDone() {
     server.requestAuthentication();
     return;
   }
+  if (otaDowngradeBlocked) {
+    server.send(409, "application/json", "{\"ok\":false,\"downgrade\":true,\"error\":\"" + otaErrorMessage + "\"}");
+    return;
+  }
   if (otaHasError) {
-    server.send(400, "application/json", "{\"ok\":false,\"error\":\"update failed, see /api/log\"}");
+    String msg = otaErrorMessage.length() ? otaErrorMessage : "update failed, see /api/log";
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"" + msg + "\"}");
     return;
   }
   server.send(200, "application/json", "{\"ok\":true,\"note\":\"flashed -- rebooting into new firmware\"}");
@@ -1394,8 +1636,12 @@ void handleLog() {
 // blocks for ~1-2s, which will visibly stall the panel's scroll animation
 // for that long (loop() can't run while this handler is blocked) -- an
 // acceptable tradeoff for an admin action you trigger manually and
-// infrequently, not something to run on a timer.
+// infrequently, not something to run on a timer. Gated like /api/config and
+// /api/reboot: unlike /api/display or /api/clear (worst case, a wrong
+// flight number shows), an unauthenticated version of this is a free,
+// repeatable panel-stalling DoS for anyone on the LAN.
 void handleWifiScan() {
+  if (!requireAuth()) return;
   int n = WiFi.scanNetworks();
   JsonDocument doc;
   JsonArray arr = doc.to<JsonArray>();
@@ -1415,6 +1661,7 @@ void handleWifiScan() {
 // keep the numbers live without a full page reload.
 void handleStatus() {
   JsonDocument doc;
+  doc["firmwareVersion"] = FIRMWARE_VERSION;
   doc["uptimeSec"] = millis() / 1000;
   doc["secondsSinceLastPush"] = lastDisplayPush == 0 ? -1 : (long)((millis() - lastDisplayPush) / 1000);
   doc["freeHeapKB"] = ESP.getFreeHeap() / 1024;
@@ -1428,15 +1675,21 @@ void handleStatus() {
   doc["hostname"] = cfgHostname;
   doc["timezone"] = cfgTzOverrideEnabled ? "manual override" : "auto (IP-geolocation at boot)";
   // Raw config values (as opposed to the display-formatted "timezone" field
-  // above) -- the admin page's JS uses these to pre-fill the config form on
-  // load, since handleAdmin() itself is now a static template with no
-  // per-request HTML building (see its comment).
+  // above) -- the admin console's Config tab uses these to pre-fill its
+  // form on load (see ConfigForm.jsx's one-shot hydration).
   doc["tzOverrideEnabled"] = cfgTzOverrideEnabled;
   doc["tzOffsetSec"] = cfgTzOverrideEnabled ? cfgTzOverrideOffsetSec : TIMEZONE_OFFSET_SEC_FALLBACK;
   doc["nightModeEnabled"] = cfgNightModeEnabled;
   doc["nightBrightness"] = cfgNightBrightness;
   doc["nightStartHour"] = cfgNightStartHour;
   doc["nightEndHour"] = cfgNightEndHour;
+  doc["iconBaseUrl"] = cfgIconBaseUrl;
+  doc["ntpServer"] = cfgNtpServer;
+  // Surfaced in the admin console so the default-credentials warning isn't
+  // serial-log-only (see setupServer()'s boot-time log line) -- most people
+  // never look at USB serial once a board is deployed, so that log line
+  // alone is easy to miss forever.
+  doc["usingDefaultAdminCreds"] = (strcmp(ADMIN_PASSWORD, "changeme") == 0);
   doc["nowShowing"] = lineFlightAlt.length() ? lineFlightAlt : "(clock)";
   doc["route"] = lineIata.length() ? lineIata : "";
   String out;
@@ -1476,248 +1729,268 @@ bool parseUtcOffset(const String &s, long *outSec) {
   return true;
 }
 
-// GET / -- server-rendered status + config admin page. Deliberately no JS:
-// this is a plain reload-to-refresh page, not a live dashboard -- the
-// existing /debug/screenshot.bmp already covers "what's on the panel right
-// now" for anyone who wants that.
-// GET / -- the admin dashboard. Unlike v1 (server-built HTML string per
-// request), this is one static template with no per-request string
-// concatenation: it fetches /api/status, /api/icons, /api/log as JSON on
-// load (and polls status + the live preview periodically) and hydrates the
-// DOM with JS. Cheaper on-device (no String churn on every GET /) and lets
-// the preview/status refresh live instead of only on a manual reload.
-// PROGMEM keeps this out of the 328KB RAM budget -- it's ~6KB of template
-// that only ever needs to live in flash until send() streams it out.
-const char ADMIN_PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html><head><meta charset='utf-8'>
-<meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>Mini Flightwall</title>
-<style>
-body{font-family:monospace;background:#111;color:#ddd;max-width:720px;margin:2em auto;padding:0 1em}
-h1{color:#6cf;font-size:1.3em;margin-bottom:.2em}
-.sub{color:#777;margin-bottom:1em}
-section{border:1px solid #333;border-radius:6px;padding:12px 16px;margin-bottom:1em}
-section>h2{margin:0 0 10px;color:#6cf;font-size:1em}
-table{width:100%;border-collapse:collapse}
-td{padding:2px 8px;border-bottom:1px solid #2a2a2a}
-td:first-child{color:#999;white-space:nowrap}
-input,button,select{font-family:inherit;background:#222;color:#ddd;border:1px solid #444;padding:4px 8px;margin:2px 0;border-radius:3px}
-button{cursor:pointer}
-button:hover{border-color:#6cf}
-fieldset{border:1px solid #333;border-radius:4px;margin-bottom:.5em}
-#preview{width:256px;height:256px;image-rendering:pixelated;border:1px solid #333;border-radius:4px;display:block;margin-bottom:8px}
-.icongrid{display:flex;flex-wrap:wrap;gap:8px}
-.icon{text-align:center;font-size:.7em;color:#999}
-.icon img{width:48px;height:48px;image-rendering:pixelated;border:1px solid #333;border-radius:3px;display:block}
-.icon button{font-size:.7em;padding:1px 4px;margin-top:2px}
-.wifinet{display:flex;justify-content:space-between;padding:2px 0;border-bottom:1px solid #2a2a2a}
-#log{background:#0a0a0a;color:#8f8;font-size:.75em;max-height:220px;overflow-y:auto;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all}
-.pill{display:inline-block;padding:0 6px;border-radius:8px;font-size:.75em;background:#1a3a1a;color:#8f8}
-</style></head><body>
-
-<h1 id='hostnameTitle'>Mini Flightwall</h1>
-<div class='sub'>Aircraft Overhead Display -- admin console</div>
-
-<section>
-<h2>Live preview</h2>
-<img id='preview' src='/debug/screenshot.bmp' alt='live panel preview'>
-<table id='statusTable'></table>
-</section>
-
-<section>
-<h2>Icons (<span id='iconCount'>-</span> loaded) <button onclick='loadIcons()'>Refresh</button></h2>
-<div class='icongrid' id='iconGrid'></div>
-<p>Upload a 24x24 raw565 <code>.bin</code> (from <code>tools/convert_tiles.py</code>) --
-shows on the panel immediately; merged onto the SD card on the next reboot.</p>
-<input type='file' id='iconFile' accept='.bin'>
-<button onclick='uploadIcon()'>Upload</button>
-<span id='uploadStatus'></span>
-</section>
-
-<section>
-<h2>WiFi</h2>
-<button onclick='scanWifi()'>Scan nearby networks</button>
-<div id='wifiResults'></div>
-</section>
-
-<section>
-<h2>Config</h2>
-<form method='POST' action='/api/config'>
-<table>
-<tr><td>Hostname</td><td><input name='hostname' id='cfgHostname'> <i>(reboot to apply)</i></td></tr>
-<tr><td>Brightness</td><td><input name='brightness' id='cfgBrightness' type='number' min='1' max='255'> <i>(1-255, live)</i></td></tr>
-<tr><td>TZ override</td><td><input name='tzOverrideEnabled' id='cfgTzEnabled' type='checkbox'> enabled
-  <input name='tzOffset' id='cfgTzOffset' placeholder='e.g. +8:00'></td></tr>
-<tr><td>Night mode</td><td><input name='nightModeEnabled' id='cfgNightEnabled' type='checkbox'> enabled,
-  dim to <input name='nightBrightness' id='cfgNightBrightness' type='number' min='1' max='255' style='width:4em'>
-  from <input name='nightStart' id='cfgNightStart' type='number' min='0' max='23' style='width:3em'>:00
-  to <input name='nightEnd' id='cfgNightEnd' type='number' min='0' max='23' style='width:3em'>:00 (local time)</td></tr>
-</table>
-<button type='submit'>Save</button>
-</form>
-</section>
-
-<section>
-<h2>Log <span class='pill' id='logStatus'>live</span></h2>
-<pre id='log'>loading...</pre>
-</section>
-
-<section>
-<h2>Firmware update</h2>
-<p>Upload a compiled <code>.bin</code> (Arduino IDE: Sketch &gt; Export Compiled Binary).
-Flashes and reboots automatically -- no confirmation step once you click Flash, so
-double-check the file first. <b>Requires the admin credentials</b> (your browser will
-prompt) -- the one endpoint on this board gated beyond the usual LAN-only trust model,
-because the stakes here are higher than a wrong flight number on the panel. If the
-firmware fails to boot properly 3 times in a row, it automatically reverts to the
-previous working version.</p>
-<input type='file' id='otaFile' accept='.bin'>
-<button onclick='uploadOta()'>Flash</button>
-<span id='otaStatus'></span>
-</section>
-
-<form method='POST' action='/api/reboot' onsubmit="return confirm('Reboot now?')">
-<button type='submit'>Reboot board</button>
-</form>
-
-<script>
-function fmtOffset(sec) {
-  const sign = sec < 0 ? '-' : '+';
-  const a = Math.abs(sec);
-  const h = Math.floor(a / 3600);
-  const m = Math.floor((a % 3600) / 60);
-  return sign + h + ':' + (m < 10 ? '0' : '') + m;
+// True if `s` looks like a bare hostname or IP literal suitable for
+// configTime()'s server argument -- NOT a URL. configTime() does no
+// validation of its own, so a pasted "https://pool.ntp.org/" or an empty
+// string would silently become a bogus NTP server that just never
+// resolves/replies, with no error until you notice the clock never syncs.
+// Used by handleConfig() to validate the admin page's NTP server field
+// before writing it to NVS, same pattern as parseUtcOffset() above.
+bool isPlausibleNtpServer(const String &s) {
+  if (s.length() == 0 || s.length() > 63) return false;
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    bool ok = isalnum((unsigned char)c) || c == '.' || c == '-' || c == ':';
+    if (!ok) return false;
+  }
+  return true;
 }
 
-let formHydrated = false;
+// ---- Admin console static assets (React/MUI SPA, built separately under
+// web/ and pushed to the board with tools/deploy_web.py) ----
+//
+// Unlike v1/v2 (a template string baked into the firmware image), the
+// admin console now lives as pre-gzipped static files on the FATFS
+// partition under /web/ (see setupFatFS() -- this partition has no
+// DMA-unsafe window, so it's safe to read on every request even while the
+// display is running). Keeping the UI off the firmware image means it can
+// be redeployed without a full OTA reflash, and there's no meaningful
+// firmware-size budget concern with 22MB of FATFS to work with.
+//
+// Every request this handler serves is looked up as its own path with a
+// literal ".gz" suffix on FATFS (deploy_web.py gzips the whole build
+// output before uploading) -- e.g. GET / -> /web/index.html.gz,
+// GET /assets/index-XYZ.js -> /web/assets/index-XYZ.js.gz. There's no SPA
+// client-side routing to fall back to index.html for: this is a single
+// page with no route changes, so a missing file is just a 404.
+const char *mimeTypeFor(const String &path) {
+  if (path.endsWith(".html")) return "text/html";
+  if (path.endsWith(".js")) return "application/javascript";
+  if (path.endsWith(".css")) return "text/css";
+  if (path.endsWith(".svg")) return "image/svg+xml";
+  if (path.endsWith(".png")) return "image/png";
+  if (path.endsWith(".ico")) return "image/x-icon";
+  if (path.endsWith(".woff2")) return "font/woff2";
+  if (path.endsWith(".json")) return "application/json";
+  // Deliberately not "application/octet-stream": _streamFileCore() (the
+  // ESP32 WebServer core) skips the Content-Encoding: gzip header for that
+  // exact content type, and every file this handler serves is gzipped on
+  // disk -- an unmapped extension falling back to octet-stream would be
+  // served as raw gzip bytes with no header saying so, which the browser
+  // can't render. "text/plain" keeps the gzip header without needing a
+  // real guess at the type.
+  return "text/plain";
+}
 
-function refreshStatus() {
-  fetch('/api/status').then(r => r.json()).then(s => {
-    document.getElementById('hostnameTitle').textContent = s.hostname;
-    document.title = s.hostname;
-    document.getElementById('iconCount').textContent = s.iconCount;
-    const lastPush = s.secondsSinceLastPush < 0 ? 'none yet this boot'
-      : s.secondsSinceLastPush + 's ago' + (s.secondsSinceLastPush >= 300 ? ' -- STALE, fell back to clock' : '');
-    const rows = [
-      ['Uptime', s.uptimeSec + 's'],
-      ['Last display push', lastPush],
-      ['Free heap', s.freeHeapKB + ' KB'],
-      ['Free PSRAM', s.freePsramKB + ' KB'],
-      ['WiFi', s.wifiSsid + ' (' + s.rssi + ' dBm)'],
-      ['IP', s.ip],
-      ['MAC', s.mac],
-      ['Timezone', s.timezone],
-      ['Brightness', s.brightness + ' / 255'],
-      ['Now showing', s.nowShowing],
-      ['Route', s.route || '-'],
-    ];
-    document.getElementById('statusTable').innerHTML =
-      rows.map(r => '<tr><td>' + r[0] + '</td><td>' + r[1] + '</td></tr>').join('');
+void handleWebStatic() {
+  String path = server.uri();
+  if (path == "/") path = "/index.html";
+  String fatPath = "/web" + path + ".gz";
 
-    // Only pre-fill the config form once -- otherwise a periodic refresh
-    // would stomp on whatever the user is mid-typing.
-    if (!formHydrated) {
-      formHydrated = true;
-      document.getElementById('cfgHostname').value = s.hostname;
-      document.getElementById('cfgBrightness').value = s.brightness;
-      document.getElementById('cfgTzEnabled').checked = s.tzOverrideEnabled;
-      document.getElementById('cfgTzOffset').value = fmtOffset(s.tzOffsetSec);
-      document.getElementById('cfgNightEnabled').checked = s.nightModeEnabled;
-      document.getElementById('cfgNightBrightness').value = s.nightBrightness;
-      document.getElementById('cfgNightStart').value = s.nightStartHour;
-      document.getElementById('cfgNightEnd').value = s.nightEndHour;
+  if (!FFat.exists(fatPath)) {
+    server.send(404, "text/plain", "not found -- has the admin console been deployed? see tools/deploy_web.py");
+    return;
+  }
+
+  File f = FFat.open(fatPath, FILE_READ);
+  if (!f) {
+    // FFat.exists() said yes, but the open still failed (e.g. a zero-length
+    // file left behind by a deploy that was interrupted mid-upload) --
+    // don't hand a File in an unknown state to streamFile().
+    server.send(500, "text/plain", "failed to open " + fatPath);
+    return;
+  }
+  // streamFile() (WebServer.cpp's _streamFileCore()) already adds
+  // Content-Encoding: gzip itself whenever the File's name ends in ".gz"
+  // and the given contentType isn't gzip/octet-stream -- which is every
+  // request this handler serves. Don't also sendHeader() it here: headers
+  // aren't deduped, so the response would carry "gzip, gzip" and the
+  // browser would fail to decode it (ERR_CONTENT_DECODING_FAILED).
+  // mimeTypeFor() is passed the un-suffixed `path`, not `fatPath`, so the
+  // Content-Type itself still comes out correct (e.g. "application/javascript").
+  server.streamFile(f, mimeTypeFor(path));
+  f.close();
+}
+
+// Recursively deletes everything under dirPath (FATFS has real
+// subdirectories, unlike SPIFFS, so this has to recurse rather than just
+// listing one level -- web/assets/ is one level deep in practice, but this
+// doesn't assume that). Collects paths up front rather than deleting while
+// the directory handle from openNextFile() is still walking it, same
+// reasoning as movePendingUploads() above.
+//
+// The 64/16 arrays cap how much one pass can hold (kept small deliberately
+// -- each stack frame here is ~1.3KB against the ~8KB loop-task stack, see
+// movePendingUploads()'s comment on the same budget). If a directory has
+// more entries than that, this recurses on itself to sweep the remainder
+// instead of silently leaving them behind.
+void deleteRecursive(const String &dirPath) {
+  File dir = FFat.open(dirPath);
+  if (!dir || !dir.isDirectory()) return;
+
+  String files[64];
+  String dirs[16];
+  int nFiles = 0, nDirs = 0;
+  bool truncated = false;
+
+  File f = dir.openNextFile();
+  while (f) {
+    if (f.isDirectory()) {
+      if (nDirs < 16) dirs[nDirs++] = String(f.path());
+      else truncated = true;
+    } else {
+      if (nFiles < 64) files[nFiles++] = String(f.path());
+      else truncated = true;
     }
-  }).catch(() => {});
+    f = dir.openNextFile();
+  }
+  dir.close();
+
+  for (int i = 0; i < nFiles; i++) FFat.remove(files[i]);
+  for (int i = 0; i < nDirs; i++) {
+    deleteRecursive(dirs[i]);
+    FFat.rmdir(dirs[i]);
+  }
+
+  // Only recurse if this pass actually made progress -- otherwise a
+  // FFat.remove() that keeps failing on the same entries would recurse
+  // forever (the watchdog would eventually catch it, but there's no reason
+  // to rely on that).
+  if (truncated && nFiles > 0) deleteRecursive(dirPath);
 }
 
-function loadIcons() {
-  fetch('/api/icons').then(r => r.json()).then(names => {
-    document.getElementById('iconGrid').innerHTML = names.map(n =>
-      "<div class='icon'><img src='/api/icon.bmp?name=" + n + "'><div>" + n + '</div>' +
-      "<button onclick=\"deleteIcon('" + n + "')\">delete</button></div>"
-    ).join('');
-  });
+// POST /api/web/clear -- wipes /web/ before a fresh deploy. Needed because
+// Vite hashes output filenames per build (index-XYZ123.js); without this,
+// every redeploy would leave the previous build's assets behind forever.
+// Gated the same as /api/ota -- arbitrary flash writes are exactly the
+// kind of endpoint this board's usual no-auth convention excludes.
+void handleWebClear() {
+  if (!requireAuth()) return;
+  deleteRecursive("/web");
+  server.send(200, "application/json", "{\"ok\":true}");
 }
 
-function deleteIcon(name) {
-  if (!confirm('Delete ' + name + '? (frees memory now; removed from the SD card on next reboot)')) return;
-  fetch('/api/icons/delete?name=' + encodeURIComponent(name), { method: 'POST' })
-    .then(() => loadIcons());
+// State shared between handleWebUploadData()/handleWebUploadDone(), same
+// pattern as the icon and OTA uploads above.
+File webUploadFile;
+String webUploadError;
+bool webUploadStarted = false;
+bool webUploadUnauthorized = false;
+
+// POST /api/web/upload (multipart, field "file", uploaded with its
+// filename set to the relative target path, e.g.
+// "assets/index-XYZ.js.gz") -- deploy_web.py's per-file upload call. The
+// resulting /web/<filename> path must stay under /web/ (checked below) so
+// this can't be used to overwrite anything else on the partition, e.g.
+// /pending or the FAT filesystem's own internals.
+void handleWebUploadData() {
+  HTTPUpload &upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    webUploadStarted = true;
+    webUploadError = "";
+    webUploadUnauthorized = !server.authenticate(ADMIN_USER, ADMIN_PASSWORD);
+    if (webUploadUnauthorized) return;
+
+    // The target path travels as the multipart field's filename (e.g.
+    // "assets/index-XYZ.js.gz"), not a ?path= query arg -- during a
+    // multipart upload, server.arg() reads the multipart form fields, not
+    // the URL query string (the same reason handleIconUploadData() above
+    // derives its filename from upload.filename rather than an arg).
+    String path = "/web/" + upload.filename;
+    // The "/web/" prefix is guaranteed by construction above -- ".." is the
+    // actual containment check, blocking a filename like "../../secrets.h"
+    // from escaping this directory.
+    if (path.indexOf("..") >= 0) {
+      webUploadError = "invalid path";
+      return;
+    }
+
+    int lastSlash = path.lastIndexOf('/');
+    if (lastSlash > 0) {
+      String dir = path.substring(0, lastSlash);
+      // mkdir one level at a time -- FFat.mkdir() (like most FAT
+      // implementations) doesn't create intermediate directories.
+      int from = 1;
+      while (true) {
+        int slash = dir.indexOf('/', from);
+        String prefix = slash < 0 ? dir : dir.substring(0, slash);
+        if (!FFat.exists(prefix)) FFat.mkdir(prefix);
+        if (slash < 0) break;
+        from = slash + 1;
+      }
+    }
+
+    webUploadFile = FFat.open(path, FILE_WRITE);
+    if (!webUploadFile) webUploadError = "failed to open " + path;
+
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!webUploadUnauthorized && webUploadFile) webUploadFile.write(upload.buf, upload.currentSize);
+
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (webUploadFile) webUploadFile.close();
+
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (webUploadFile) webUploadFile.close();
+    webUploadError = "upload aborted";
+  }
 }
 
-function uploadIcon() {
-  const input = document.getElementById('iconFile');
-  const status = document.getElementById('uploadStatus');
-  if (!input.files.length) { status.textContent = 'choose a file first'; return; }
-  const fd = new FormData();
-  fd.append('icon', input.files[0]);
-  status.textContent = 'uploading...';
-  fetch('/api/icons/upload', { method: 'POST', body: fd })
-    .then(r => r.json())
-    .then(j => {
-      status.textContent = j.ok ? 'done' : ('error: ' + j.error);
-      if (j.ok) { input.value = ''; loadIcons(); }
-    })
-    .catch(() => { status.textContent = 'upload failed'; });
+void handleWebUploadDone() {
+  if (webUploadUnauthorized) {
+    server.requestAuthentication();
+    webUploadUnauthorized = false;
+    webUploadStarted = false; // clear regardless of outcome, same reasoning as handleIconUploadDone()
+    return;
+  }
+  if (!webUploadStarted) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"no file received\"}");
+    return;
+  }
+  webUploadStarted = false;
+  if (webUploadError.length()) {
+    String err = webUploadError;
+    webUploadError = "";
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"" + err + "\"}");
+  } else {
+    server.send(200, "application/json", "{\"ok\":true}");
+  }
 }
 
-function uploadOta() {
-  const input = document.getElementById('otaFile');
-  const status = document.getElementById('otaStatus');
-  if (!input.files.length) { status.textContent = 'choose a file first'; return; }
-  if (!confirm('Flash ' + input.files[0].name + ' and reboot? This cannot be undone from here.')) return;
-  const fd = new FormData();
-  fd.append('firmware', input.files[0]);
-  status.textContent = 'flashing... (do not close this page or power off the board)';
-  fetch('/api/ota', { method: 'POST', body: fd })
-    .then(r => r.json())
-    .then(j => {
-      status.textContent = j.ok ? 'flashed -- rebooting, this page will go dark briefly' : ('error: ' + j.error);
-    })
-    .catch(() => { status.textContent = 'board rebooting (connection dropped, which is expected)'; });
-}
-
-function scanWifi() {
-  const el = document.getElementById('wifiResults');
-  el.textContent = 'Scanning (~2s, panel scroll will pause)...';
-  fetch('/api/wifi/scan').then(r => r.json()).then(nets => {
-    nets.sort((a, b) => b.rssi - a.rssi);
-    el.innerHTML = nets.map(n =>
-      "<div class='wifinet'><span>" + (n.secure ? '🔒 ' : '') + n.ssid + '</span><span>' + n.rssi + ' dBm</span></div>'
-    ).join('') || '<i>none found</i>';
-  });
-}
-
-function refreshLog() {
-  fetch('/api/log').then(r => r.text()).then(t => {
-    const el = document.getElementById('log');
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 20;
-    el.textContent = t;
-    if (atBottom) el.scrollTop = el.scrollHeight;
-  }).catch(() => {});
-}
-
-refreshStatus();
-loadIcons();
-refreshLog();
-setInterval(refreshStatus, 3000);
-setInterval(refreshLog, 5000);
-setInterval(() => { document.getElementById('preview').src = '/debug/screenshot.bmp?t=' + Date.now(); }, 1000);
-</script>
-</body></html>)HTML";
-
-void handleAdmin() {
-  server.send_P(200, "text/html", ADMIN_PAGE);
-}
-
-// Gates POST /api/config and (via the two-phase check in handleOtaData(),
-// since it's an upload) POST /api/ota. Every other endpoint on this board
-// stays unauthenticated -- see secrets.h.example and the README for why
-// specifically these two. server.requestAuthentication() sends a real 401
+// Gates POST /api/config, POST /api/reboot, GET /api/wifi/scan, and (via the
+// two-phase check in handleOtaData(), since it's an upload) POST /api/ota.
+// Every other endpoint on this board stays unauthenticated -- see
+// secrets.h.example and the README for why specifically these. Reboot and
+// WiFi-scan were added to this list alongside config/OTA because, unlike
+// /api/display or /api/clear (worst case: a wrong flight number shows),
+// leaving them open is a free, repeatable denial-of-service for anyone on
+// the LAN (reboot knocks the panel offline; scan blocks loop() for ~1-2s
+// each call). server.requestAuthentication() sends a real 401
 // with WWW-Authenticate: Basic, which makes the browser show its native
 // credential prompt (this works for a fetch()-initiated request too, not
 // just a page navigation) and then cache the credentials for the origin,
 // not just this one handler's response.
+//
+// That last part is also exactly the CSRF exposure worth guarding against
+// here: once a browser has cached Basic Auth credentials for this origin,
+// it attaches them automatically to *any* request to that origin --
+// including one triggered by a form or fetch() on a completely different
+// page the admin happens to have open at the same time. A cross-origin
+// request can't forge the Origin header itself (the browser sets it, not
+// the page's JS), so rejecting a mismatch here blocks that case without
+// needing a CSRF token. A same-origin browser request always sends a
+// matching Origin (or none, for older/simple requests, which this doesn't
+// penalize), and script/CLI clients (curl, deploy_web.py) typically send no
+// Origin at all -- so absence is allowed through; only a *mismatched*
+// Origin is treated as suspicious.
 bool requireAuth() {
+  if (server.hasHeader("Origin")) {
+    String expected = "http://" + server.hostHeader();
+    if (server.header("Origin") != expected) {
+      server.send(403, "application/json", "{\"error\":\"cross-origin request rejected\"}");
+      return false;
+    }
+  }
   if (!server.authenticate(ADMIN_USER, ADMIN_PASSWORD)) {
     server.requestAuthentication();
     return false;
@@ -1731,10 +2004,10 @@ bool requireAuth() {
 // immediately (via applyBrightnessForTime() at the end, not a direct
 // setBrightness8() call here -- see that function's comment for why: a
 // direct call would ignore whether it's currently inside the night window),
-// hostname and a newly-enabled/changed TZ override need a reboot
-// (WiFi.setHostname() only takes effect before WiFi.begin(), and
-// re-running configTime() live is more moving parts than just asking for a
-// reboot, same UX as hostname).
+// hostname, a newly-enabled/changed TZ override, and the NTP server all
+// need a reboot (WiFi.setHostname() only takes effect before WiFi.begin(),
+// and re-running configTime() live is more moving parts than just asking
+// for a reboot, same UX as hostname).
 void handleConfig() {
   if (!requireAuth()) return;
 
@@ -1793,6 +2066,31 @@ void handleConfig() {
       prefs.putUChar("nightEnd", cfgNightEndHour);
     }
   }
+
+  if (server.hasArg("iconBaseUrl")) {
+    String url = server.arg("iconBaseUrl");
+    url.trim();
+    while (url.endsWith("/")) url.remove(url.length() - 1); // normalize away trailing slash(es)
+    if (url.length() == 0 || url.startsWith("https://")) {
+      cfgIconBaseUrl = url;
+      prefs.putString("iconBaseUrl", cfgIconBaseUrl);
+    }
+    // else: doesn't look like an https:// URL -- leave the previous value
+    // alone rather than silently disabling sync, same reasoning as the
+    // TZ-offset parse above.
+  }
+
+  if (server.hasArg("ntpServer")) {
+    String s = server.arg("ntpServer");
+    s.trim();
+    if (isPlausibleNtpServer(s)) {
+      cfgNtpServer = s;
+      prefs.putString("ntpServer", cfgNtpServer);
+    }
+    // else: doesn't look like a bare hostname/IP -- leave the previous
+    // value alone rather than saving something that'll just never resolve.
+  }
+
   applyBrightnessForTime(); // pick up any brightness/night-mode change immediately, night-window-aware
 
   server.sendHeader("Location", "/");
@@ -1800,6 +2098,7 @@ void handleConfig() {
 }
 
 void handleReboot() {
+  if (!requireAuth()) return;
   server.send(200, "text/plain", "Rebooting...");
   delay(200); // let the response actually flush before the restart
   ESP.restart();
@@ -1811,20 +2110,26 @@ void setupServer() {
                         "credentials -- set ADMIN_USER/ADMIN_PASSWORD in secrets.h if that's not "
                         "acceptable for your network.");
   }
-  server.on("/", HTTP_GET, handleAdmin);
+  server.on("/", HTTP_GET, handleWebStatic);
   server.on("/api/config", HTTP_POST, handleConfig);
   server.on("/api/reboot", HTTP_POST, handleReboot);
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/log", HTTP_GET, handleLog);
   server.on("/api/icons", HTTP_GET, handleIconList);
   server.on("/api/icon.bmp", HTTP_GET, handleIconBmp);
+  server.on("/api/icons/sync", HTTP_POST, handleIconSync);
   server.on("/api/icons/delete", HTTP_POST, handleIconDelete);
   server.on("/api/icons/upload", HTTP_POST, handleIconUploadDone, handleIconUploadData);
   server.on("/api/ota", HTTP_POST, handleOtaDone, handleOtaData);
+  server.on("/api/web/clear", HTTP_POST, handleWebClear);
+  server.on("/api/web/upload", HTTP_POST, handleWebUploadDone, handleWebUploadData);
   server.on("/api/wifi/scan", HTTP_GET, handleWifiScan);
   server.on("/api/display", HTTP_POST, handleDisplay);
   server.on("/api/clear", HTTP_POST, handleClear);
   server.on("/debug/screenshot.bmp", HTTP_GET, handleScreenshot);
+  // Everything else (the SPA's hashed JS/CSS bundle under /assets/, any
+  // future static file) falls through to the same FATFS-backed handler.
+  server.onNotFound(handleWebStatic);
   server.begin();
 }
 
@@ -1846,10 +2151,16 @@ void setup() {
   setupWiFi();            // needed before the icon sync below; also fine to
                           // run before setupMatrix() since WiFi doesn't
                           // touch SD or the panel.
+  setupNTP();             // must run before syncIcons() -- WiFiClientSecure's
+                           // useBuiltinCACertBundle() validates each cert's
+                           // not-before/not-after against the system clock,
+                           // and without NTP that clock is still at the Unix
+                           // epoch, so every TLS handshake "fails" with a
+                           // generic HTTP -1 (cert "not yet valid") no matter
+                           // how correct the icon base URL is.
   syncIcons(true);        // last chance to touch SD before DMA starts
   lastIconSync = millis(); // next periodic check is ICON_SYNC_INTERVAL_MS from now
   setupMatrix();
-  setupNTP();
   setupServer();
   setupWatchdog();          // deliberately last -- see that function's comment
                              // for why (everything above here can legitimately
