@@ -8,7 +8,6 @@ import Container from '@mui/material/Container';
 import CssBaseline from '@mui/material/CssBaseline';
 import DashboardIcon from '@mui/icons-material/Dashboard';
 import IconButton from '@mui/material/IconButton';
-import ImageIcon from '@mui/icons-material/Image';
 import MemoryIcon from '@mui/icons-material/Memory';
 import Stack from '@mui/material/Stack';
 import Tab from '@mui/material/Tab';
@@ -23,7 +22,6 @@ import WifiIcon from '@mui/icons-material/Wifi';
 import { getJson } from './api.js';
 import ConfigForm from './components/ConfigForm.jsx';
 import Dashboard from './components/Dashboard.jsx';
-import Icons from './components/Icons.jsx';
 import LogViewer from './components/LogViewer.jsx';
 import Logo from './components/Logo.jsx';
 import SystemTab from './components/SystemTab.jsx';
@@ -35,7 +33,6 @@ const STATUS_POLL_MS = 3000;
 
 const TABS = [
   { label: 'Dashboard', icon: <DashboardIcon fontSize="small" />, Component: Dashboard, needsStatus: true },
-  { label: 'Icons', icon: <ImageIcon fontSize="small" />, Component: Icons },
   { label: 'WiFi', icon: <WifiIcon fontSize="small" />, Component: WifiScan },
   { label: 'Config', icon: <TuneIcon fontSize="small" />, Component: ConfigForm, needsStatus: true },
   { label: 'System', icon: <MemoryIcon fontSize="small" />, Component: SystemTab, needsStatus: true },

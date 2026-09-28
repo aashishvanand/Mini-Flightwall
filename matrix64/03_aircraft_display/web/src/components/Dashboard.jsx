@@ -104,7 +104,7 @@ export default function Dashboard({ status }) {
         <StatCard icon={<TimerIcon fontSize="small" />} label="Uptime" value={fmtUptime(status.uptimeSec)} />
         <StatCard icon={<MemoryIcon fontSize="small" />} label="Free heap" value={status.freeHeapKB} unit="KB" />
         <StatCard icon={<StorageIcon fontSize="small" />} label="Free PSRAM" value={status.freePsramKB} unit="KB" />
-        <StatCard icon={<ImageIcon fontSize="small" />} label="Icons loaded" value={status.iconCount} />
+        <StatCard icon={<ImageIcon fontSize="small" />} label="Airline icon" value={status.iconShown ? 'shown' : 'none'} />
       </Box>
 
       <FooterBar status={status} />

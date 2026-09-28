@@ -2,12 +2,11 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import Autocomplete from '@mui/material/Autocomplete';
 import Button from '@mui/material/Button';
 import Checkbox from '@mui/material/Checkbox';
-import Divider from '@mui/material/Divider';
 import FormControlLabel from '@mui/material/FormControlLabel';
 import Stack from '@mui/material/Stack';
 import TextField from '@mui/material/TextField';
 import Typography from '@mui/material/Typography';
-import { postConfig, postEmpty } from '../api.js';
+import { postConfig } from '../api.js';
 import { labelForZone, listTimeZones, offsetStringForZone } from '../timezones.js';
 
 function fmtOffset(sec) {
@@ -28,15 +27,12 @@ const EMPTY_FORM = {
   nightBrightness: '',
   nightStart: '',
   nightEnd: '',
-  iconBaseUrl: '',
   ntpServer: '',
 };
 
 export default function ConfigForm({ status }) {
   const [form, setForm] = useState(EMPTY_FORM);
   const [saveStatus, setSaveStatus] = useState('');
-  const [syncStatus, setSyncStatus] = useState('');
-  const [syncing, setSyncing] = useState(false);
   // Pre-fill the form from /api/status only once -- a periodic status
   // refresh must never stomp on what the user is mid-typing. Mirrors the
   // `formHydrated` flag in the previous plain-JS admin page.
@@ -55,7 +51,6 @@ export default function ConfigForm({ status }) {
       nightBrightness: status.nightBrightness,
       nightStart: status.nightStartHour,
       nightEnd: status.nightEndHour,
-      iconBaseUrl: status.iconBaseUrl,
       ntpServer: status.ntpServer,
     });
   }, [status]);
@@ -88,29 +83,10 @@ export default function ConfigForm({ status }) {
       nightBrightness: form.nightBrightness,
       nightStart: form.nightStart,
       nightEnd: form.nightEnd,
-      iconBaseUrl: form.iconBaseUrl,
       ntpServer: form.ntpServer,
     })
       .then((r) => setSaveStatus(r.ok ? 'saved' : `error (${r.status})`))
       .catch(() => setSaveStatus('save failed'));
-  };
-
-  const syncNow = () => {
-    setSyncing(true);
-    setSyncStatus('saving URL...');
-    // syncIcons() on the board reads the saved cfgIconBaseUrl, not
-    // whatever's currently typed here -- save just this field first (other
-    // fields are left untouched, see handleConfig()'s per-field hasArg()
-    // guards) so "Sync now" always acts on what's in the box, unsaved or not.
-    postConfig({ iconBaseUrl: form.iconBaseUrl })
-      .then(() => {
-        setSyncStatus('syncing... (panel scroll will pause briefly)');
-        return postEmpty('/api/icons/sync');
-      })
-      .then((r) => r.json())
-      .then((j) => setSyncStatus(j.ok ? `done -- ${j.iconCount} icons loaded` : `error: ${j.error}`))
-      .catch(() => setSyncStatus('sync failed'))
-      .finally(() => setSyncing(false));
   };
 
   return (
@@ -210,25 +186,6 @@ export default function ConfigForm({ status }) {
             disabled={!form.nightModeEnabled}
             sx={{ width: 140 }}
           />
-        </Stack>
-      </Stack>
-
-      <Divider />
-
-      <Stack spacing={1}>
-        <TextField
-          label="Icon sync base URL"
-          size="small"
-          placeholder="https://data.example.dev/24x24"
-          helperText="No trailing slash. <url>/manifest.json and <url>/<name>.bin are fetched from here. Leave empty to disable remote icon sync."
-          value={form.iconBaseUrl}
-          onChange={set('iconBaseUrl')}
-        />
-        <Stack direction="row" spacing={2} alignItems="center">
-          <Button variant="outlined" size="small" onClick={syncNow} disabled={syncing}>
-            Sync now
-          </Button>
-          <Typography variant="caption">{syncStatus}</Typography>
         </Stack>
       </Stack>
 

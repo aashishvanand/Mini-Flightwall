@@ -1,6 +1,6 @@
 # Mini Flightwall
 
-A 64×64 RGB LED matrix that shows whatever aircraft is currently flying overhead — flight number, altitude, airline logo, aircraft type, and route — updated automatically every 30 seconds. When there's nothing overhead, it falls back to a clock.
+A 64×64 RGB LED matrix that shows whatever aircraft is currently flying overhead — flight number, altitude, airline logo, aircraft type and registration, and route with a flight-progress marker — updated automatically every 30 seconds. When there's nothing overhead, it falls back to a clock.
 
 An n8n workflow polls [OpenSky Network](https://opensky-network.org/) and [FlightRadar24](https://www.flightradar24.com/)'s live feed for aircraft near a configured home location, enriches the match with route/aircraft-type data from [adsbdb](https://www.adsbdb.com/) (cross-checked against FR24's live data, since adsbdb's callsign→route table can be stale), and POSTs a JSON payload to a small HTTP server running on an ESP32-S3.
 
@@ -16,6 +16,7 @@ n8n (every 30s)
   -> OpenSky Network + FlightRadar24  (nearest aircraft near HOME_LAT/HOME_LON,
                                         merged/de-duplicated by icao24)
   -> adsbdb           (route + aircraft type lookup by callsign / icao24)
+  -> airline_icons    (n8n data table: the airline's 24x24 logo, sent inline)
   -> FlightRadar24    (cross-checks adsbdb's route; falls back to FR24's live
                         route/aircraft type when adsbdb has nothing or looks stale)
   -> HTTP POST /api/display  -> ESP32-S3 -> 64x64 HUB75 panel
@@ -34,7 +35,6 @@ If nothing is found nearby, n8n instead calls `POST /api/clear` and the panel fa
 *SGD figures are a rough conversion at ~74.5 INR/SGD (August 2026) for reference only — check a live rate before budgeting.*
 
 You'll also need:
-- A microSD card (FAT32) for storing preloaded airline-logo icons
 - A 5V power supply sized for your panel's brightness setting (the sketches default to `setBrightness8(60)` to keep current draw modest — raise with care)
 - A machine running [n8n](https://n8n.io/) (self-hosted or cloud) to run the workflow
 - A free [OpenSky Network](https://opensky-network.org/) API client ID/secret (OAuth2 client credentials)
@@ -47,9 +47,9 @@ matrix64/
     web/                  Admin console SPA (React + MUI) -- deployed to the board's
                           FATFS partition, not baked into the firmware, see
                           "Admin web console" below
-icons/                    Preprocessed 24x24 raw RGB565 airline-logo icons (copy to SD card /icons)
+icons/                    Legacy 24x24 raw RGB565 icon set from firmware <=1.2.x's SD card -- unused since 1.3.0
 tools/
-  convert_tiles.py        Converts source logo images (webp/png/jpg) to the icons/*.bin format
+  convert_tiles.py        Legacy: converts logos to the icons/*.bin format (icons now come from the n8n table)
   deploy_web.py           Builds web/ and pushes it to a board's FATFS partition
 matrix64_aircraft_workflow.json   n8n workflow: OpenSky+FR24 -> adsbdb (FR24-verified) -> matrix
 ```
@@ -60,17 +60,13 @@ The Waveshare ESP32-S3 RGB Matrix Driver Board is built to plug directly onto th
 
 1. **Panel <-> driver board**: connect the driver board to the panel's HUB75 input using the IDC ribbon cable that ships with the driver board. The connector is keyed (notched), so it only seats one way — don't force it.
 2. **Power**: feed 5V into the panel's power input (screw terminal or barrel jack, depending on your panel), sized for your brightness setting. The firmware defaults to `setBrightness8(60)` (roughly 25% duty) specifically to keep current draw modest until you've confirmed your supply can handle full brightness — a 64×64 panel at full white, full brightness can pull several amps.
-3. **SD card**: format a microSD card FAT32, copy `icons/*.bin` onto it under `/icons/` (Aircraft Overhead Display firmware only), and insert it into the driver board's SD slot **before** powering on — the board reads it once at boot and never touches it again while running.
-4. **USB-C**: connect the driver board to your computer for flashing and for Serial Monitor output (WiFi connection status, the assigned IP, icon-preload count, etc.).
+3. **USB-C**: connect the driver board to your computer for flashing and for Serial Monitor output (WiFi connection status, the assigned IP, etc.).
 
-The driver board's GPIO wiring to the panel and SD card is fixed by Waveshare and already baked into the sketches — you don't need to configure it, but it's documented here since it explains a couple of the config lines in the code:
+No SD card is needed (since firmware 1.3.0 -- icons arrive inline with every push). The driver board's GPIO wiring to the panel is fixed by Waveshare and already baked into the sketches — you don't need to configure it, but it's documented here since it explains a couple of the config lines in the code:
 
 | Signal | GPIO | Where it's set |
 |---|---|---|
 | HUB75 row-address line E (needed for 64-row panels) | 9 | `mxconfig.gpio.e` in `setupMatrix()` |
-| SD_MMC data line (D0) | 17 | `BSP_SD_D0` |
-| SD_MMC command line (CMD) | 44 | `BSP_SD_CMD` |
-| SD_MMC clock line (CLK) | 1 | `BSP_SD_CLK` |
 
 ## Arduino IDE setup
 
@@ -79,9 +75,9 @@ The driver board's GPIO wiring to the panel and SD card is fixed by Waveshare an
 3. Select the board: **Tools > Board > esp32 > ESP32S3 Dev Module**.
 4. Under **Tools**, set:
    - **USB CDC On Boot**: Enabled (so Serial Monitor works over USB-C without a separate UART adapter)
-   - **PSRAM**: OPI PSRAM (the icon cache and the off-screen canvas live in PSRAM — required for Aircraft Overhead Display). This board (Waveshare's ESP32-S3-N32R16 driver board) has 16MB of Octal PSRAM, which is what "OPI" refers to.
+   - **PSRAM**: OPI PSRAM (large allocations such as the TLS buffers and JSON documents land there — required for Aircraft Overhead Display; flashing without it leaves the board heap-starved). This board (Waveshare's ESP32-S3-N32R16 driver board) has 16MB of Octal PSRAM, which is what "OPI" refers to.
    - **Flash Size**: **32MB (256Mb)** — this board's chip is the N32R16 variant (32MB flash, 16MB PSRAM). The IDE's default is 4MB regardless of board choice; leaving it on the default doesn't break anything (the firmware still fits fine either way), it just leaves ~28MB of the chip's actual flash completely unpartitioned and unusable.
-   - **Partition Scheme**: **32M Flash (4.8MB APP/22MB FATFS)** — pick this only after Flash Size above is set to 32MB (a 32MB-sized partition table on a board set to 4MB will fail to flash). Gives 4.8MB of app space instead of ~1.2MB, comfortable headroom for the admin web console and anything added to it later. The 22MB FATFS partition goes unused (icons live on the SD card via SD_MMC, config in NVS/Preferences) — it's just what this scheme bundles; a "no FS" 32MB scheme would be marginally more correct but isn't offered by the IDE's ESP32S3 board definitions as of this writing.
+   - **Partition Scheme**: **32M Flash (4.8MB APP/22MB FATFS)** — pick this only after Flash Size above is set to 32MB (a 32MB-sized partition table on a board set to 4MB will fail to flash). Gives 4.8MB of app space instead of ~1.2MB, comfortable headroom for the admin web console and anything added to it later. The 22MB FATFS partition holds the admin web console (see "Admin web console"); config lives in NVS/Preferences.
    - **Port**: whichever `/dev/cu.usbmodem*` (macOS) or `COM*` (Windows) appears when the board is plugged in
 5. Install libraries via **Tools > Manage Libraries**:
    - `ESP32 HUB75 LED MATRIX PANEL DMA Display` by mrfaptastic
@@ -94,7 +90,7 @@ Double-check board-specific settings (exact partition scheme, PSRAM mode) agains
 ## Firmware setup
 
 1. **Panel bring-up test** (not included here): run Waveshare's own stock examples (`01_SimpleTestShapes` / `07_Pixel_Mapping_Test`) with `PANEL_RES_Y` changed to 64, to confirm the panel lights up correctly before writing any custom code. An earlier bring-up sketch of our own (`matrix64/02_http_display` -- WiFi + a bare HTTP endpoint, validating networking and the double-buffer/flip drawing pattern) has since been removed now that the production firmware is working end-to-end; those config decisions (panel driver, GPIO wiring, buffer-flip timing) are documented inline in `03_aircraft_display.ino` instead.
-2. **Aircraft Overhead Display** — `matrix64/03_aircraft_display`: the production firmware — preloads airline icons from SD into PSRAM at boot, renders the aircraft layout, and falls back to an NTP clock when idle. Also serves `/debug/screenshot.bmp` so you can see exactly what's on the panel from a browser, no camera needed.
+2. **Aircraft Overhead Display** — `matrix64/03_aircraft_display`: the production firmware — renders the aircraft layout from each n8n push (airline logo included inline), and falls back to an NTP clock when idle. Also serves `/debug/screenshot.bmp` so you can see exactly what's on the panel from a browser, no camera needed.
 
 For each sketch:
 
@@ -107,56 +103,31 @@ cp secrets.h.example secrets.h
 
 ### Icons (Aircraft Overhead Display only)
 
-Icons are 24×24 raw RGB565 pixel dumps — no file header, 1,152 bytes each — because that's the simplest format the ESP32 can load straight into a `uint16_t` buffer with no decoding at runtime. `icons/` in this repo already has the pre-converted `.bin` files for a couple hundred airline codes; copy the ones you need onto the SD card under `/icons/`. The filename (minus `.bin`) is the `icon` key sent in the JSON payload, e.g. `sq_logo.bin` for Singapore Airlines.
+The board stores no icons. The n8n workflow's **Build Payload (Matrix64)** node resolves which logo to show from the `airline_icons` data table (the same table the Ulanzi clocks use): the airline's ICAO designator first, then its IATA code, then the generic `00` row (a blank tail) — so a missing logo reads as "no art yet" instead of a stale or wrong one. Every push carries the pixels inline as `iconData`: the row's `icon24` column, 24×24 raw little-endian RGB565 (1,152 bytes, no header — the simplest thing the ESP32 can draw straight from a `uint16_t` buffer), base64-encoded to 1,536 chars. The firmware decodes it once per push; anything that isn't exactly 1,152 bytes after decoding blanks the icon slot and logs why.
 
-The n8n workflow's **Build Payload (Matrix64)** node resolves which icon to send: it tries the airline's IATA code first, falls back to its ICAO code if there's no icon for the IATA (or no IATA at all, e.g. military/cargo callsigns), and falls back to `00_logo` (a blank tail) if neither has one — so a missing icon reads as "no art yet" instead of a stale or wrong logo. That node keeps a hardcoded `AVAILABLE_ICONS` set of every code currently in `icons/`; regenerate it (`ls icons | sed 's/_logo\.bin$//' | sort`) and paste it back in whenever you add or remove icons.
+Adding or changing a logo means adding or updating a table row — Ulanzi Feeder's `sync_icons.py` converts a TailFin source logo into `icon8`/`icon16`/`icon24` in one pass. Neither the workflow nor the firmware changes, and the new logo shows on the very next push.
 
-To add or regenerate icons from source logo images (`.webp`, `.png`, `.jpg`):
+Firmware up to 1.2.x instead preloaded `icons/*.bin` from an SD card and synced them from a remote manifest (`tools/sync_icons_r2.sh`); that path is gone as of 1.3.0. `icons/` and `tools/convert_tiles.py` are kept for reference only.
 
-```bash
-python3 -m venv venv && venv/bin/pip install pillow numpy
-venv/bin/python tools/convert_tiles.py --input logos/ --size 24 --format raw565 --output icons
+### Display layout
+
+Five sections of 6×8 px text (size 1), separated by 2 px gaps. The logo sits at the left edge of the middle section, and the text beside it is clipped to its own column so a scrolling name never runs over the logo:
+
+```
+ y  0-7    Singapore Airlines                  airline name
+ y 10-17   SQ962   1950ft▲ 174kt               flight, altitude, climb/descend, speed
+ y 20-43   ┌──────┐ Boeing                     make          (y 20)
+           │ logo │ B38M                       ICAO type     (y 28)
+           └──────┘ 9V-MBL                     registration  (y 36)
+ y 46-53   SIN ━━━►┈┈┈┈┈┈┈ CGK                 route + progress marker
+ y 56-63   Singapore Changi -> Soekarno-Hatta  city names (always scrolls)
 ```
 
-Uses emblem-focus detection (crops tightly around the actual logo mark -- birds, cranes, flags, kapok flowers -- so it fills most of the 24x24 tile instead of sitting small in a plain letterboxed square), unsharp masking, and a two-pass downscale before writing RGB565, `<name>_logo.bin` per source file. Ported from the [Ulanzi Feeder](../Ulanzi%20Feeder) repo's 8x8 AWTRIX converter -- see `tools/convert_tiles.py --help` for options.
-
-Three ways a new or changed icon reaches the board, in increasing order of how "permanent" the change is meant to be:
-
-1. **Admin console upload** (`http://<board-ip>/`, Icons section) -- fastest for a one-off fix, shows on the panel immediately. See "Icon upload via the admin console" further down.
-2. **Remote sync** (below) -- the way to roll out a whole icon-set update (e.g. after a `convert_tiles.py` regeneration) without pulling the SD card by hand.
-3. **Pull the SD card and copy `icons/*.bin` onto it directly** -- always works, no network dependency, but means physically accessing the board.
-
-All three end up in the same place: SD's `/icons/` is the durable source of truth `preloadIcons()` reads at boot, regardless of which path got a file there.
-
-#### Remote icon sync
-
-Icons are hosted as static files on any S3-compatible object storage (or really, anything served over plain HTTPS) — the firmware just does a `GET`, no vendor SDK or API involved:
-
-- **At boot**, right after WiFi connects and before the HUB75 DMA starts (the SD card is unreliable once it's running), `syncIcons(true)` GETs `manifest.json` from the configured base URL, downloads whatever's missing or changed, writes it to `/icons/` on the SD card, and loads it into PSRAM.
-- **Every `ICON_SYNC_INTERVAL_MS`** (3 days by default) while running, `loop()` calls `syncIcons(false)` — same manifest diff, but PSRAM-only, since SD can't be touched once the display's DMA is active. Those updates get persisted to SD on the next reboot regardless.
-- **On demand**, the Config tab's **Sync now** button (`POST /api/icons/sync`) runs the same PSRAM-only pass immediately, instead of waiting up to 3 days — useful right after changing the URL or updating the remote manifest.
-
-`manifest.json` is a JSON array of `{"name", "sha256"}` — the SHA-256 lets the firmware tell "already have this" apart from "have a file by this name but the art changed," and download only what's actually different.
-
-**Security against a MITM or malicious proxy:** every request validates the server's TLS certificate against the ESP32 core's built-in CA bundle (`useBuiltinCACertBundle()`, not `setInsecure()`) and disables HTTP redirects, so a network attacker can't substitute a different host or downgrade the connection. On top of that, every downloaded icon's SHA-256 is checked against the hash the manifest declared for it — fetched over that same validated connection — before it's written to SD or shown on the panel; a mismatch is dropped silently rather than displayed. This also means a compromised object (even one served with a technically-valid cert) gets caught by the hash check as long as the manifest itself wasn't tampered with in the same request.
-
-**Setting the base URL:** it's a runtime setting (NVS-backed, like hostname/brightness/etc.), editable live from the admin console's **Config** tab — no reflash needed, and it takes effect on the next sync (or immediately via **Sync now**). `secrets.h`'s `ICON_BASE_URL` is only the *seed* value used the first time the board boots with an empty NVS; from then on the Config tab value wins. Either way it's `<base>/<prefix>` with no trailing slash — `<base>/manifest.json` and `<base>/<name>.bin` must both resolve. Leaving it empty skips the sync entirely — the SD card's existing icons still work.
-
-Any S3-compatible bucket with public HTTPS access works — Cloudflare R2, AWS S3, MinIO, Backblaze B2, etc. `tools/sync_icons_r2.sh` is the reference implementation, using R2 (chosen for free egress and an S3-compatible API):
-
-1. `wrangler login`, then `wrangler r2 bucket create <bucket-name>`.
-2. In the Cloudflare dashboard, open the bucket → **Settings** → **Public access** → **Allow Access**, and copy the `r2.dev` URL, or attach a custom domain (e.g. `data.airportdata.dev`).
-3. Set the base URL from the admin console's Config tab (or `ICON_BASE_URL` in `secrets.h` before first boot).
-
-Whenever `icons/` changes:
-
-```bash
-./tools/sync_icons_r2.sh <bucket-name> [prefix]
-```
-
-`prefix` defaults to `24x24` to match the layout above; pass `""` to upload to the bucket root instead. This uploads every `icons/*.bin` plus a `manifest.json` with each one's SHA-256. New/changed icons show up within one sync interval, or immediately via the Config tab's **Sync now** button. On a different S3-compatible provider, upload the same `icons/*.bin` files plus a matching `manifest.json` (name + sha256 per file) however that provider's tooling works (`aws s3 cp`, `mc mirror`, rclone, etc.) — the firmware doesn't care how the files got there, only that they're reachable over HTTPS at the configured base URL.
-
-Object storage was chosen over Cloudflare Images because the `.bin` files are headerless raw RGB565 dumps, not a format Images can store or serve — Images is built for re-encoding/serving actual photos, not arbitrary binary blobs.
+- **Logo**: 24×24 px at x 0–23, y 20–43, drawn from the push's `iconData` (see "Icons" above). If a push has no valid icon, that space stays blank and the text column doesn't move.
+- **Beside the logo**: make, ICAO type and registration on three 8px rows starting at x 26, which exactly fill the logo's 24px height (a 6-character registration like `9V-SMA` exactly fills the column; anything longer scrolls within it). Before 1.3.1 there were only make and type, spaced out at y 24 and y 34.
+- **Other rows** stay still when the text fits, and scroll when it doesn't. The flight/altitude row is usually long enough to scroll.
+- **Climb/descend**: a green ▲ (climbing) or amber ▼ (descending) after the altitude, omitted within ±200 ft/min of level. Both are CP437 glyphs (`0x1E`/`0x1F`) from Adafruit GFX's built-in font — no custom bitmaps.
+- **Route row**: origin code flush left, destination flush right, and a track between them with a green ► (`0x10`) at the payload's `progress` — solid over the part already flown, dotted over what's left. Without `progress` (an FR24-only route, which has no airport coordinates) the marker sits centered on an all-dotted track.
 
 ## n8n workflow setup
 
@@ -216,18 +187,26 @@ Then activate it. It polls every 30 seconds, finds the nearest airborne aircraft
   "altitudeFt": 35000,
   "speedKt": 460, "verticalRateFpm": 1200,
   "airline": "Singapore Airlines",
-  "originCode": "SIN", "destCode": "KUL",
+  "originCode": "SIN", "destCode": "KUL", "progress": 0.42,
   "originCity": "Singapore Changi Airport",
   "destCity": "Kuala Lumpur International Airport",
-  "icon": "sq_logo", "make": "Airbus", "modelShort": "A388"
+  "icon": "sq_logo", "iconData": "<1536 base64 chars>",
+  "make": "Airbus", "modelShort": "A388", "tail": "9V-SKA"
 }
 ```
+
+`tail` is the registration (FR24 first, then adsbdb), shown under the type
+beside the logo; omitted when neither source has it (typically private/GA).
+`progress` (0–1, share of the trip flown) is distance-from-origin over
+origin + remaining distance, and is only sent when adsbdb supplied both
+airports' coordinates. `iconData` is described under "Icons" above; `icon`
+(the logo code) is ignored by firmware 1.3.0+ and kept for older builds.
 
 `speedKt` / `verticalRateFpm` are `null` when the source feed didn't report
 them for that aircraft (firmware omits the line rather than showing `0`).
 `originCity`/`destCity`/`airline` are only present when adsbdb's route data
 was trusted (see "n8n workflow setup" above) — a FR24-sourced route still
-sets `originCode`/`destCode`/`icon`, just without the city names or airline
+sets `originCode`/`destCode`/`iconData`, just without the city names or airline
 name adsbdb would have added.
 
 ## API reference (firmware)
@@ -244,16 +223,11 @@ normal operation, they exist for the page's own JS to call.
 
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/` | GET | Admin dashboard -- live preview, status, icon browser, WiFi scan, config, log, reboot, firmware update |
-| `/api/status` | GET | JSON status snapshot (uptime, heap/PSRAM, WiFi, icon count, current config, what's showing) |
-| `/api/config` | POST | Update hostname / brightness / timezone override / night mode / icon sync base URL (form-encoded, persisted to NVS). **Requires HTTP Basic Auth** |
+| `/` | GET | Admin dashboard -- live preview, status, WiFi scan, config, log, reboot, firmware update |
+| `/api/status` | GET | JSON status snapshot (uptime, heap/PSRAM, WiFi, whether an icon is showing, current config, what's showing) |
+| `/api/config` | POST | Update hostname / brightness / timezone override / night mode / NTP server (form-encoded, persisted to NVS). **Requires HTTP Basic Auth** |
 | `/api/reboot` | POST | Reboot the board |
 | `/api/log` | GET | Tail of the in-memory log ring buffer (plain text) |
-| `/api/icons` | GET | JSON array of every icon name currently loaded in PSRAM |
-| `/api/icon.bmp?name=<n>` | GET | A single icon's pixels as a BMP (for the admin page's icon grid) |
-| `/api/icons/sync` | POST | Manually run a remote icon sync now (PSRAM only) instead of waiting for the next periodic pass. Blocks ~1-2s+ depending on how much changed; the panel's scroll will visibly pause, same as `/api/wifi/scan` |
-| `/api/icons/delete?name=<n>` | POST | Remove an icon from PSRAM now; actually deleted from the SD card on next reboot (SD can't be touched while the display's DMA is running -- see "Icons" above) |
-| `/api/icons/upload` | POST | Upload a 24x24 raw565 `.bin` (multipart/form-data) -- stages to internal flash (FATFS, no DMA-unsafe window), loads into PSRAM immediately, merged onto the SD card on next reboot. See "Icon upload via the admin console" below |
 | `/api/wifi/scan` | GET | JSON list of nearby SSIDs (blocks ~1-2s; the panel's scroll will visibly pause) |
 | `/api/ota` | POST | Flash a new firmware `.bin` (multipart/form-data) and reboot into it. **Requires HTTP Basic Auth** -- see "OTA firmware updates" below |
 | `/api/web/upload` | POST | Write one file (multipart/form-data, field `file`, uploaded with its filename set to the relative target path, e.g. `assets/index-XYZ.js.gz`) to `/web/<filename>` on the FATFS partition. **Requires HTTP Basic Auth**. Used by `tools/deploy_web.py`, not meant to be called by hand |
@@ -264,8 +238,8 @@ normal operation, they exist for the page's own JS to call.
 `http://<board-ip>/` -- a React + MUI single-page app (source under
 `matrix64/03_aircraft_display/web/`), not a status page: the panel preview
 and status numbers auto-refresh via JS polling `/api/status` and
-`/debug/screenshot.bmp` (no need to reload the page). From it you can browse
-and delete loaded icons, upload new ones, scan for WiFi networks, watch the
+`/debug/screenshot.bmp` (no need to reload the page). From it you can scan
+for WiFi networks, watch the
 live log, edit hostname/brightness/timezone-override, reboot, and flash new
 firmware -- all documented in the API table above.
 
@@ -273,7 +247,7 @@ Unlike the previous plain-HTML version, the built app isn't baked into the
 firmware image at all -- it's deployed separately as static files on the
 board's internal FATFS partition (`/web/`, the same 22MB FATFS partition
 described in "Arduino IDE setup"), served by `handleWebStatic()` in the
-firmware. That partition has no DMA-unsafe window (unlike the SD card), so
+firmware. That partition has no DMA-unsafe window, so
 it's safe to read/write at any time, including while the display is
 running. This means UI changes can be redeployed without a full firmware
 reflash, and there's no realistic firmware-size pressure from the UI's
@@ -299,25 +273,6 @@ has. That's an explicit, accepted tradeoff for a board that's meant to
 never be exposed to the WAN, not an oversight. Changing config, flashing
 firmware, and deploying the web console itself are the exceptions, gated
 behind HTTP Basic Auth; see "OTA firmware updates" below for why.
-
-### Icon upload via the admin console
-
-Upload a `.bin` produced by `tools/convert_tiles.py` (exactly 1,152 bytes --
-24x24 raw565, same format as everything on the SD card) through the Icons
-section of `/`. It's staged to a `/pending` directory on the board's
-internal flash (FATFS, mounted from the 32MB partition scheme's `ffat`
-partition -- see "Arduino IDE setup") rather than the SD card, because
-internal flash has no DMA-unsafe window the way SD_MMC does: it can be
-written to at any time, including while the display is actively running.
-
-The upload shows on the panel immediately (loaded straight into PSRAM), but
-`/pending` is intentionally not the icon's permanent home -- on the *next*
-boot, before `preloadIcons()` runs, every file in `/pending` is copied into
-SD's `/icons/` (overwriting any existing file of the same name -- last
-upload wins) and then deleted from `/pending`. SD stays the single durable
-copy of record, same as it's always been for icons that arrive via the R2
-remote-sync path; uploaded icons just take one extra boot to actually land
-there instead of being written to SD directly.
 
 ### OTA firmware updates
 
