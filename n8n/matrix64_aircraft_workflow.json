@@ -414,7 +414,7 @@
                 208
             ],
             "parameters": {
-                "jsCode": "const nearest = $('Nearest Aircraft').first().json;\nconst resp = $('Lookup Route (adsbdb)').first().json;\nconst fr24 = $('Verify Route (FR24)').first().json;\n\nfunction distanceKm(lat1, lon1, lat2, lon2) {\n  const R = 6371;\n  const dLat = (lat2 - lat1) * Math.PI / 180;\n  const dLon = (lon2 - lon1) * Math.PI / 180;\n  const a = Math.sin(dLat / 2) ** 2 +\n    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;\n  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));\n}\n\n// FlightRadar24's live feed (unofficial data-cloud.flightradar24.com/zones/fcgi/feed.js\n// endpoint) reflects what's actually airborne right now, unlike adsbdb/hexdb.io's static\n// flight-number tables, which can hold decade-old records (TGW543/TR543 resolved to a\n// stale 2012 SYD-MEL entry in both). It also carries private/GA aircraft with a filed\n// flight plan that adsbdb has no scheduled-flight-number record for at all.\nfunction findFr24Match(callsign) {\n  if (!fr24 || fr24.error || typeof fr24 !== 'object') return null;\n  for (const info of Object.values(fr24)) {\n    if (!Array.isArray(info)) continue; // skip \"full_count\"/\"version\"/\"stats\" keys\n    if (info[16] === callsign) {\n      return {\n        from: info[11] || null,\n        to: info[12] || null,\n        // No separate IATA field in the live feed -- same trick the FlightRadarAPI\n        // wrappers use: derive it from the flight number prefix. Null for a\n        // private/GA aircraft with no commercial flight number, which correctly\n        // falls through to the generic icon downstream.\n        airlineIata: info[13] ? String(info[13]).slice(0, 2).toLowerCase() : null,\n      };\n    }\n  }\n  return null;\n}\n\nconst adsbdbOk = !(resp && resp.error);\nconst route = adsbdbOk && resp && resp.response && resp.response.flightroute;\n\n// No live FR24 entry for this callsign. Fall back to trusting adsbdb's route only if\n// the aircraft is currently within a plausible distance of one of its claimed airports.\nconst PLAUSIBLE_RADIUS_KM = 150;\nfunction adsbdbPlausible() {\n  if (!route || !route.origin || !route.destination) return false;\n  if (typeof nearest.lat !== 'number' || typeof nearest.lon !== 'number') return true;\n  const dOrigin = distanceKm(nearest.lat, nearest.lon, route.origin.latitude, route.origin.longitude);\n  const dDest = distanceKm(nearest.lat, nearest.lon, route.destination.latitude, route.destination.longitude);\n  return dOrigin <= PLAUSIBLE_RADIUS_KM || dDest <= PLAUSIBLE_RADIUS_KM;\n}\n\nconst adsbdbRoute = route && route.origin && route.destination\n  ? { from: route.origin.iata_code || route.origin.icao_code, to: route.destination.iata_code || route.destination.icao_code }\n  : null;\nconst adsbdbAirlineIata = route && route.airline && route.airline.iata ? route.airline.iata.toLowerCase() : null;\nconst callsignIata = route && route.callsign_iata ? route.callsign_iata : null;\n\nconst fr24Match = findFr24Match(nearest.callsign);\nconst fr24Route = fr24Match && fr24Match.from && fr24Match.to ? { from: fr24Match.from, to: fr24Match.to } : null;\n\nlet match = null;\nif (adsbdbRoute && fr24Route) {\n  match = adsbdbRoute.from === fr24Route.from && adsbdbRoute.to === fr24Route.to;\n}\n\n// Trust order: a live FR24 match first (real current trajectory) beats adsbdb's route\n// unconditionally; otherwise adsbdb's route only if it's geographically plausible given\n// where the aircraft actually is right now. adsbdb having nothing at all (private jets,\n// unknown callsigns, network errors) no longer blanks the whole cycle by itself -- FR24\n// alone is enough to show a route/callsign, and vice versa.\nlet trustedRoute = null;\nlet trustedSource = 'none';\nif (fr24Route) {\n  trustedRoute = fr24Route;\n  trustedSource = 'fr24';\n} else if (adsbdbRoute && adsbdbPlausible()) {\n  trustedRoute = adsbdbRoute;\n  trustedSource = 'adsbdb-plausible';\n}\n\n// Prefer adsbdb's airline metadata when it succeeded; otherwise fall back to FR24's\n// flight-number-derived IATA code; null for a private/GA aircraft with no commercial\n// flight number at all, which correctly resolves to the generic icon downstream.\nconst airlineIata = adsbdbAirlineIata || (fr24Match ? fr24Match.airlineIata : null);\n\n// Nothing usable from either source -- skip this push cycle so the clock keeps\n// showing its last good entry instead of a bare, unconfirmed callsign.\nconst skip = !adsbdbOk && !fr24Match;\n\n// This full comparison stays on the item (visible in the n8n execution log for every\n// run) even though only trustedRoute/airlineIata get used downstream -- so a bad\n// adsbdb record, or a case where only one source had data, is obvious at a glance.\nreturn [{\n  json: {\n    skip,\n    callsign: nearest.callsign,\n    callsignIata,\n    airlineIata,\n    adsbdbOk,\n    adsbdb: adsbdbRoute,\n    fr24: fr24Route,\n    match,\n    trustedRoute,\n    trustedSource\n  }\n}];\n"
+                "jsCode": "const nearest = $('Nearest Aircraft').first().json;\nconst resp = $('Lookup Route (adsbdb)').first().json;\nconst fr24 = $('Verify Route (FR24)').first().json;\n\nfunction distanceKm(lat1, lon1, lat2, lon2) {\n  const R = 6371;\n  const dLat = (lat2 - lat1) * Math.PI / 180;\n  const dLon = (lon2 - lon1) * Math.PI / 180;\n  const a = Math.sin(dLat / 2) ** 2 +\n    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;\n  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));\n}\n\n// FlightRadar24's live feed (unofficial data-cloud.flightradar24.com/zones/fcgi/feed.js\n// endpoint) reflects what's actually airborne right now, unlike adsbdb/hexdb.io's static\n// flight-number tables, which can hold decade-old records (TGW543/TR543 resolved to a\n// stale 2012 SYD-MEL entry in both). It also carries private/GA aircraft with a filed\n// flight plan that adsbdb has no scheduled-flight-number record for at all.\nfunction findFr24Match(callsign) {\n  if (!fr24 || fr24.error || typeof fr24 !== 'object') return null;\n  for (const info of Object.values(fr24)) {\n    if (!Array.isArray(info)) continue; // skip \"full_count\"/\"version\"/\"stats\" keys\n    if (info[16] === callsign) {\n      return {\n        from: info[11] || null,\n        to: info[12] || null,\n        // Field 18 is the operator's ICAO airline designator (SIA, QTR, ASY) --\n        // the code actually filed in the ATC callsign, and unique per operator,\n        // unlike IATA codes, which get reassigned. Empty for private/GA.\n        airlineIcao: info[18] ? String(info[18]).toLowerCase() : null,\n      };\n    }\n  }\n  return null;\n}\n\nconst adsbdbOk = !(resp && resp.error);\nconst route = adsbdbOk && resp && resp.response && resp.response.flightroute;\n\n// No live FR24 entry for this callsign. Fall back to trusting adsbdb's route only if\n// the aircraft is currently within a plausible distance of one of its claimed airports.\nconst PLAUSIBLE_RADIUS_KM = 150;\nfunction adsbdbPlausible() {\n  if (!route || !route.origin || !route.destination) return false;\n  if (typeof nearest.lat !== 'number' || typeof nearest.lon !== 'number') return true;\n  const dOrigin = distanceKm(nearest.lat, nearest.lon, route.origin.latitude, route.origin.longitude);\n  const dDest = distanceKm(nearest.lat, nearest.lon, route.destination.latitude, route.destination.longitude);\n  return dOrigin <= PLAUSIBLE_RADIUS_KM || dDest <= PLAUSIBLE_RADIUS_KM;\n}\n\nconst adsbdbRoute = route && route.origin && route.destination\n  ? { from: route.origin.iata_code || route.origin.icao_code, to: route.destination.iata_code || route.destination.icao_code }\n  : null;\nconst adsbdbAirlineIata = route && route.airline && route.airline.iata ? route.airline.iata.toLowerCase() : null;\nconst adsbdbAirlineIcao = route && route.airline && route.airline.icao ? route.airline.icao.toLowerCase() : null;\nconst callsignIata = route && route.callsign_iata ? route.callsign_iata : null;\n\nconst fr24Match = findFr24Match(nearest.callsign);\nconst fr24Route = fr24Match && fr24Match.from && fr24Match.to ? { from: fr24Match.from, to: fr24Match.to } : null;\n\nlet match = null;\nif (adsbdbRoute && fr24Route) {\n  match = adsbdbRoute.from === fr24Route.from && adsbdbRoute.to === fr24Route.to;\n}\n\n// Trust order: a live FR24 match first (real current trajectory) beats adsbdb's route\n// unconditionally; otherwise adsbdb's route only if it's geographically plausible given\n// where the aircraft actually is right now. adsbdb having nothing at all (private jets,\n// unknown callsigns, network errors) no longer blanks the whole cycle by itself -- FR24\n// alone is enough to show a route/callsign, and vice versa.\nlet trustedRoute = null;\nlet trustedSource = 'none';\nif (fr24Route) {\n  trustedRoute = fr24Route;\n  trustedSource = 'fr24';\n} else if (adsbdbRoute && adsbdbPlausible()) {\n  trustedRoute = adsbdbRoute;\n  trustedSource = 'adsbdb-plausible';\n}\n\n// Airline identity for icons: the ICAO designator, from FR24's live feed first (same\n// trust order as the route), else adsbdb's airline record. airlineIata is only ever\n// adsbdb's own IATA field -- never derived from a flight number or callsign. Both\n// null for a private/GA aircraft, which resolves to the generic icon downstream.\nconst airlineIcao = (fr24Match && fr24Match.airlineIcao) || adsbdbAirlineIcao;\nconst airlineIata = adsbdbAirlineIata;\n\n// Nothing usable from either source -- skip this push cycle so the clock keeps\n// showing its last good entry instead of a bare, unconfirmed callsign.\nconst skip = !adsbdbOk && !fr24Match;\n\n// This full comparison stays on the item (visible in the n8n execution log for every\n// run) even though only trustedRoute/airlineIata get used downstream -- so a bad\n// adsbdb record, or a case where only one source had data, is obvious at a glance.\nreturn [{\n  json: {\n    skip,\n    callsign: nearest.callsign,\n    callsignIata,\n    airlineIcao,\n    airlineIata,\n    adsbdbOk,\n    adsbdb: adsbdbRoute,\n    fr24: fr24Route,\n    match,\n    trustedRoute,\n    trustedSource\n  }\n}];\n"
             }
         },
         {
@@ -481,6 +481,48 @@
                 "method": "POST",
                 "url": "=http://{{ $('Config (edit per location)').first().json.MATRIX_IP }}/api/clear",
                 "options": {}
+            }
+        },
+        {
+            "id": "ae45dcee-f27a-4081-9890-ac01624a6824",
+            "name": "Lookup Icon",
+            "type": "n8n-nodes-base.dataTable",
+            "typeVersion": 1.1,
+            "alwaysOutputData": true,
+            "onError": "continueRegularOutput",
+            "position": [
+                1040,
+                208
+            ],
+            "parameters": {
+                "resource": "row",
+                "operation": "get",
+                "dataTableId": {
+                    "__rl": true,
+                    "mode": "list",
+                    "value": ""
+                },
+                "matchType": "anyCondition",
+                "filters": {
+                    "conditions": [
+                        {
+                            "keyName": "icao",
+                            "condition": "eq",
+                            "keyValue": "={{ $json.airlineIcao || '-' }}"
+                        },
+                        {
+                            "keyName": "iata",
+                            "condition": "eq",
+                            "keyValue": "={{ $json.airlineIata || '-' }}"
+                        },
+                        {
+                            "keyName": "code",
+                            "condition": "eq",
+                            "keyValue": "00"
+                        }
+                    ]
+                },
+                "limit": 5
             }
         }
     ],
@@ -599,7 +641,7 @@
             "main": [
                 [
                     {
-                        "node": "Merge Matrix Data",
+                        "node": "Lookup Icon",
                         "type": "main",
                         "index": 0
                     }
@@ -666,6 +708,17 @@
                 [
                     {
                         "node": "Build Payload (Matrix64)",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Lookup Icon": {
+            "main": [
+                [
+                    {
+                        "node": "Merge Matrix Data",
                         "type": "main",
                         "index": 0
                     }

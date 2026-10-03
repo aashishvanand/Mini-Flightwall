@@ -16,6 +16,7 @@ headerless raw RGB565 dump -- exactly what preloadIcons() in the firmware
 expects to read straight into a uint16_t buffer.
 
 Usage:
+    python3 tools/convert_tiles.py --input logos/ --csv new_icons.csv     # rows for the n8n table
     python3 tools/convert_tiles.py --input logos/ --size 24 --format raw565 --output icons
 
 Requires Pillow and numpy:
@@ -23,6 +24,8 @@ Requires Pillow and numpy:
 """
 
 import argparse
+import base64
+import csv
 import struct
 import sys
 from pathlib import Path
@@ -160,21 +163,50 @@ def output_name(src: Path) -> str:
     return stem + ".bin"
 
 
+def write_csv(sources, size: int, csv_path: Path):
+    """One airline_icons row per source. A 2-letter filename is taken as the
+    IATA code and a 3-letter one as the ICAO designator; fill in the other
+    code and the airline name by hand before importing."""
+    rows = []
+    for src in sources:
+        try:
+            data = convert_one(src, size)
+        except Exception as exc:
+            print(f"skip {src.name}: {exc}", file=sys.stderr)
+            continue
+        code = src.stem.lower().removesuffix("_logo")
+        rows.append([code, code if len(code) == 3 else "", code if len(code) == 2 else "", "",
+                     base64.b64encode(data).decode("ascii")])
+        print(f"{src.name} -> row '{code}' ({len(data)} bytes)")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["code", "icao", "iata", "name", "icon24"])
+        writer.writerows(rows)
+    print(f"\nWrote {len(rows)}/{len(sources)} row(s) to {csv_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input", required=True, type=Path, help="Directory of source logo images (webp/png/jpg/bmp)")
     parser.add_argument("--size", type=int, default=24, help="Output tile size in pixels (default: 24, matches ICON_SIZE in the firmware)")
     parser.add_argument("--format", choices=["raw565"], default="raw565", help="Output pixel format (only raw565 is implemented -- what the firmware reads)")
-    parser.add_argument("--output", required=True, type=Path, help="Directory to write <name>_logo.bin files into")
+    out = parser.add_mutually_exclusive_group(required=True)
+    out.add_argument("--output", type=Path, help="Directory to write <name>_logo.bin files into")
+    out.add_argument("--csv", type=Path, help="Write airline_icons rows (code,icao,iata,name,icon24) to this CSV instead, "
+                     "for tools/import_icons_n8n.py. Name each source file after the airline code (sq.png, asy.png)")
     args = parser.parse_args()
 
     if not args.input.is_dir():
         sys.exit(f"--input {args.input} is not a directory")
-    args.output.mkdir(parents=True, exist_ok=True)
 
     sources = sorted(p for p in args.input.iterdir() if p.suffix.lower() in SOURCE_EXTENSIONS)
     if not sources:
         sys.exit(f"No source images ({', '.join(sorted(SOURCE_EXTENSIONS))}) found in {args.input}")
+
+    if args.csv:
+        write_csv(sources, args.size, args.csv)
+        return
+    args.output.mkdir(parents=True, exist_ok=True)
 
     converted = 0
     for src in sources:

@@ -42,16 +42,20 @@ You'll also need:
 ## Repo layout
 
 ```
+case/                     3D-printable enclosure (STEP): front bezel, back shell, and the assembly
 matrix64/
   03_aircraft_display/    Aircraft Overhead Display -- production firmware
     web/                  Admin console SPA (React + MUI) -- deployed to the board's
                           FATFS partition, not baked into the firmware, see
                           "Admin web console" below
 icons/                    Legacy 24x24 raw RGB565 icon set from firmware <=1.2.x's SD card -- unused since 1.3.0
+n8n/
+  matrix64_aircraft_workflow.json   n8n workflow: OpenSky+FR24 -> adsbdb (FR24-verified) -> matrix
+  airline_icons.csv       345 airline logos + the generic fallback, for the airline_icons data table
 tools/
-  convert_tiles.py        Legacy: converts logos to the icons/*.bin format (icons now come from the n8n table)
+  import_icons_n8n.py     Creates the airline_icons table in your n8n and loads a CSV into it
+  convert_tiles.py        Converts source logos into airline_icons CSV rows (--csv), or legacy .bin files
   deploy_web.py           Builds web/ and pushes it to a board's FATFS partition
-matrix64_aircraft_workflow.json   n8n workflow: OpenSky+FR24 -> adsbdb (FR24-verified) -> matrix
 ```
 
 ## Assembly / wiring
@@ -67,6 +71,18 @@ No SD card is needed (since firmware 1.3.0 -- icons arrive inline with every pus
 | Signal | GPIO | Where it's set |
 |---|---|---|
 | HUB75 row-address line E (needed for 64-row panels) | 9 | `mxconfig.gpio.e` in `setupMatrix()` |
+
+### Case
+
+`case/` has a two-piece printable enclosure as STEP files, commissioned by Aashish Vivekanand for this project. Most slicers (Bambu Studio, OrcaSlicer, PrusaSlicer) import STEP directly.
+
+| File | Part | Size (mm) |
+|---|---|---|
+| `mini_flightwall_case_front.step` | Front bezel: panel window, 6 counterbored panel screws | 143.9 × 143.9 × 20 |
+| `mini_flightwall_case_back.step` | Back shell: room for the driver board and wiring, keyhole wall-mount slot | 143.9 × 143.9 × 38.4 |
+| `mini_flightwall_case_assembly.step` | Both parts in position, for reference only (don't print this one) | 143.9 × 143.9 × 58.4 |
+
+Four corner screws join the two halves. A 35 mm slot on the side, cut across the seam, lets the USB-C cable out sideways so the case can sit flush against a wall.
 
 ## Arduino IDE setup
 
@@ -103,11 +119,23 @@ cp secrets.h.example secrets.h
 
 ### Icons (Aircraft Overhead Display only)
 
-The board stores no icons. The n8n workflow's **Build Payload (Matrix64)** node resolves which logo to show from the `airline_icons` data table (the same table the Ulanzi clocks use): the airline's ICAO designator first, then its IATA code, then the generic `00` row (a blank tail) — so a missing logo reads as "no art yet" instead of a stale or wrong one. Every push carries the pixels inline as `iconData`: the row's `icon24` column, 24×24 raw little-endian RGB565 (1,152 bytes, no header — the simplest thing the ESP32 can draw straight from a `uint16_t` buffer), base64-encoded to 1,536 chars. The firmware decodes it once per push; anything that isn't exactly 1,152 bytes after decoding blanks the icon slot and logs why.
+The board stores no icons. The n8n workflow's **Build Payload (Matrix64)** node resolves which logo to show from the `airline_icons` data table (see "n8n workflow setup" for loading it): the airline's ICAO designator first, then its IATA code, then the generic `00` row (a blank tail) — so a missing logo reads as "no art yet" instead of a stale or wrong one. Every push carries the pixels inline as `iconData`: the row's `icon24` column, 24×24 raw little-endian RGB565 (1,152 bytes, no header — the simplest thing the ESP32 can draw straight from a `uint16_t` buffer), base64-encoded to 1,536 chars. The firmware decodes it once per push; anything that isn't exactly 1,152 bytes after decoding blanks the icon slot and logs why.
 
-Adding or changing a logo means adding or updating a table row — Ulanzi Feeder's `sync_icons.py` converts a TailFin source logo into `icon8`/`icon16`/`icon24` in one pass. Neither the workflow nor the firmware changes, and the new logo shows on the very next push.
+Adding or changing a logo means adding or updating a table row. Neither the workflow nor the firmware changes, and the new logo shows on the very next push:
 
-Firmware up to 1.2.x instead preloaded `icons/*.bin` from an SD card and synced them from a remote manifest (`tools/sync_icons_r2.sh`); that path is gone as of 1.3.0. `icons/` and `tools/convert_tiles.py` are kept for reference only.
+```bash
+python3 -m venv venv && venv/bin/pip install pillow numpy
+# name each source logo after the airline code: sq.png (IATA) or asy.webp (ICAO-only operator)
+venv/bin/python tools/convert_tiles.py --input logos/ --csv new_icons.csv
+# fill in the icao/iata/name columns the filename didn't cover, then:
+python3 tools/import_icons_n8n.py --csv new_icons.csv
+```
+
+`convert_tiles.py` uses emblem-focus detection: it crops tightly around the logo's actual mark (bird, crane, flag, flower) so it fills the 24×24 tile instead of sitting small in a letterboxed square. Rows are upserted by `code`, so re-importing replaces an existing logo. Each `icao` must belong to only one row; a wrong ICAO code puts the wrong logo on screen, so leave it blank if unsure and the row matches on IATA alone.
+
+Airline logos are trademarks of their respective owners. They're included for personal, non-commercial display only.
+
+Firmware up to 1.2.x instead preloaded `icons/*.bin` from an SD card and synced them from a remote manifest (`tools/sync_icons_r2.sh`); that path is gone as of 1.3.0. `icons/` is kept for reference only.
 
 ### Display layout
 
@@ -131,7 +159,7 @@ Five sections of 6×8 px text (size 1), separated by 2 px gaps. The logo sits at
 
 ## n8n workflow setup
 
-`matrix64_aircraft_workflow.json` here is a standalone, self-contained
+`n8n/matrix64_aircraft_workflow.json` here is a standalone, self-contained
 template — just the matrix panel's branch, no Ulanzi AWTRIX/TC002 clock
 nodes. It's the same logic this build's actual feeder runs for the matrix
 (the real feeder's workflow additionally drives two Ulanzi clocks off the
@@ -147,8 +175,8 @@ Every 30s
      Fetch Nearby States (FR24)                                    >-- Merge Position Data -> Nearest Aircraft
   -> Aircraft Found?
        true  -> Lookup Route (adsbdb)  -\
-                Verify Route (FR24)      >-- Merge Route Data -> Compare Routes -\
-                Lookup Aircraft (adsbdb) -------------------------------------- >-- Merge Matrix Data -> Build Payload (Matrix64) -> Push to Matrix
+                Verify Route (FR24)      >-- Merge Route Data -> Compare Routes -> Lookup Icon -\
+                Lookup Aircraft (adsbdb) ---------------------------------------------------- >-- Merge Matrix Data -> Build Payload (Matrix64) -> Push to Matrix
        false -> Clear Matrix
 ```
 
@@ -170,14 +198,28 @@ Every 30s
   Payload (Matrix64)` falls back to the bare type code FlightRadar24's
   live feed reports for that `icao24` (no manufacturer name, just
   e.g. `B738`).
+- **Logo**: `Lookup Icon` reads the `airline_icons` data table, matching
+  the airline's ICAO code, its IATA code, or the generic `00` row, and
+  `Build Payload (Matrix64)` picks the best match (see "Icons" above).
 
-Import `matrix64_aircraft_workflow.json` and fill in:
+Setup (needs an n8n version with Data tables, and the n8n API enabled for step 1):
+
+1. **Load the logos.** Create an API key under **Settings > n8n API**, then:
+   ```bash
+   export N8N_URL=http://<your-n8n-host>:5678
+   export N8N_API_KEY=<your key>
+   python3 tools/import_icons_n8n.py
+   ```
+   This creates the `airline_icons` table and loads 345 airline logos plus the generic fallback tail from `n8n/airline_icons.csv`. It's safe to re-run.
+2. **Import** `n8n/matrix64_aircraft_workflow.json` (**Workflows > Import from File**).
+3. **Open the `Lookup Icon` node and select the `airline_icons` table.** Table IDs are different on every n8n instance, so the template ships with none selected. Without this step, no logo appears on the panel.
+4. **Fill in `Config (edit per location)`:**
    - `HOME_LAT` / `HOME_LON` — your location's coordinates (placeholders are `0.0` — replace before running)
    - `RADIUS_DEG` — search radius in degrees (default `0.15` ≈ ~16km)
    - `MATRIX_IP` — your ESP32's LAN IP (placeholder `192.168.1.50`)
    - `OPENSKY_CLIENT_ID` / `OPENSKY_CLIENT_SECRET` — from your [OpenSky API client credentials](https://opensky-network.org/apidoc/rest.html#authentication)
 
-Then activate it. It polls every 30 seconds, finds the nearest airborne aircraft, looks up and verifies its route and aircraft type, and pushes a display payload to the matrix. FlightRadar24's feed here is its unofficial public `data-cloud.flightradar24.com/zones/fcgi/feed.js` endpoint — no API key, but no uptime/rate-limit guarantee either; if it's ever unreachable, the workflow just falls back to OpenSky-only positioning and adsbdb-only routing (via the plausibility check above), same as before FR24 was added.
+Then activate it. It polls every 30 seconds, finds the nearest airborne aircraft, looks up and verifies its route and aircraft type, and pushes a display payload to the matrix. FlightRadar24's feed here is its unofficial public `data-cloud.flightradar24.com/zones/fcgi/feed.js` endpoint. It isn't an official or documented API: FR24 can change, rate-limit or block it at any time, and using it may go against their terms of service. Keep it to personal use and proceed with caution, or use [FR24's official API](https://fr24api.flightradar24.com/) for anything dependable or commercial. If it's ever unreachable, the workflow just falls back to OpenSky-only positioning and adsbdb-only routing (via the plausibility check above), same as before FR24 was added.
 
 ### Payload shape
 
